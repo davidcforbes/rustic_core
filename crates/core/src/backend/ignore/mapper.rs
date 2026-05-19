@@ -127,6 +127,8 @@ impl LocalSourceSaveOptions {
             size,
             links,
             extended_attributes,
+            // Task 5 replaces this with real Windows SD capture.
+            generic_attributes: Default::default(),
         };
 
         let node = self.to_node(&entry, &m, meta)?;

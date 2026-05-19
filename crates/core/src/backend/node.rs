@@ -273,6 +273,16 @@ pub struct Metadata {
     /// Extended attributes of the node
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_attributes: Vec<ExtendedAttribute>,
+    /// restic-compatible per-node generic attributes (Windows security
+    /// descriptor, file attributes, …). Keyed by the restic
+    /// `GenericAttributeType` string; the value is the JSON-string form
+    /// restic stores (for the security descriptor: base64 of the raw
+    /// self-relative SD). `String` keeps `Metadata: Ord`. Empty on
+    /// non-Windows and on metadata-free nodes, so a snapshot without
+    /// Windows metadata serialises identically to upstream
+    /// rustic_core. (kopia-0dr.39 increment 2a.)
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub generic_attributes: std::collections::BTreeMap<String, String>,
 }
 
 pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {

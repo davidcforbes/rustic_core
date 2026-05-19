@@ -471,6 +471,13 @@ pub(crate) fn set_metadata(
                 path.display()
             );
         });
+    dest.set_generic_attributes(path, &node.meta.generic_attributes)
+        .unwrap_or_else(|_| {
+            warn!(
+                "restore {}: setting generic attributes failed.",
+                path.display()
+            );
+        });
     dest.set_times(path, &node.meta)
         .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
 }

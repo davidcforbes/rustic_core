@@ -474,6 +474,18 @@ impl LocalDestination {
         Ok(())
     }
 
+    /// Apply restic generic attributes (Windows security descriptor,
+    /// …) to `item`. Task 6 implements the Windows path; on every
+    /// other platform this is a no-op. (kopia-0dr.39 increment 2a.)
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    pub(crate) fn set_generic_attributes(
+        &self,
+        _item: impl AsRef<Path>,
+        _generic_attributes: &std::collections::BTreeMap<String, String>,
+    ) -> LocalDestinationResult<()> {
+        Ok(())
+    }
+
     #[cfg(not(any(windows, target_os = "openbsd")))]
     /// Set extended attributes for `item` (relative to the base path)
     ///
