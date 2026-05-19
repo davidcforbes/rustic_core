@@ -1,4 +1,6 @@
 pub mod modification;
+#[cfg(windows)]
+pub(crate) mod win_sd;
 
 use std::{borrow::Cow, cmp::Ordering, ffi::OsStr, fmt::Debug, path::Path};
 

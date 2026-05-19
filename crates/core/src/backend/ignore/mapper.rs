@@ -127,8 +127,7 @@ impl LocalSourceSaveOptions {
             size,
             links,
             extended_attributes,
-            // Task 5 replaces this with real Windows SD capture.
-            generic_attributes: Default::default(),
+            generic_attributes: Self::generic_attributes(entry.path()),
         };
 
         let node = self.to_node(&entry, &m, meta)?;
@@ -158,6 +157,27 @@ impl LocalSourceSaveOptions {
             self.to_node_other(name, m, meta)
         };
         Ok(node)
+    }
+
+    /// restic-compatible generic attributes for a path. On Windows
+    /// this captures the security descriptor (kopia-0dr.39 inc 2a);
+    /// elsewhere it is empty.
+    #[cfg(windows)]
+    fn generic_attributes(
+        path: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        if let Some(sd) = crate::backend::node::win_sd::capture(path) {
+            m.insert(crate::backend::node::win_sd::SD_KEY.to_string(), sd);
+        }
+        m
+    }
+
+    #[cfg(not(windows))]
+    fn generic_attributes(
+        _path: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
     }
 }
 

@@ -112,6 +112,13 @@ sha2 = { version = "0.10.9", features = ["asm"] }
 # unfortunately, the asm extensions do not build on Windows, see https://github.com/RustCrypto/asm-hashes/issues/17
 # and https://github.com/RustCrypto/asm-hashes/pull/issues/78
 sha2 = "0.10.9"
+# Windows security-descriptor capture/restore (generic_attributes).
+base64 = "0.22"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [target.'cfg(not(any(windows, target_os="openbsd")))'.dependencies]
 # for local source/destination
