@@ -474,9 +474,29 @@ impl LocalDestination {
         Ok(())
     }
 
-    /// Apply restic generic attributes (Windows security descriptor,
-    /// …) to `item`. Task 6 implements the Windows path; on every
-    /// other platform this is a no-op. (kopia-0dr.39 increment 2a.)
+    /// Apply restic generic attributes to `item`. On Windows this
+    /// decodes the security descriptor from
+    /// `generic_attributes["windows.security_descriptor"]` (base64)
+    /// and applies it via `SetNamedSecurityInfoW`. Best-effort: a
+    /// decode/apply failure is silently dropped (restore continues).
+    /// kopia-0dr.39 increment 2a.
+    #[cfg(windows)]
+    pub(crate) fn set_generic_attributes(
+        &self,
+        item: impl AsRef<Path>,
+        generic_attributes: &std::collections::BTreeMap<String, String>,
+    ) -> LocalDestinationResult<()> {
+        use crate::backend::node::win_sd;
+        if let Some(b64) = generic_attributes.get(win_sd::SD_KEY) {
+            let path = self.path(item);
+            let _ = win_sd::apply(&path, b64);
+        }
+        Ok(())
+    }
+
+    /// Apply restic generic attributes to `item` — no-op off Windows.
+    /// kopia-0dr.39 increment 2a.
+    #[cfg(not(windows))]
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     pub(crate) fn set_generic_attributes(
         &self,
