@@ -53,7 +53,16 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+
+/// `ERROR_IO_REPARSE_TAG_MISMATCH` from winerror.h — returned by
+/// `FSCTL_SET_REPARSE_POINT` when the destination already carries a
+/// reparse point with a different tag. windows-sys 0.59 doesn't
+/// expose this constant, so we define it locally. Used in [`apply`]
+/// to trigger a delete-and-retry fallback when restoring (e.g.,
+/// stamping a MOUNT_POINT capture over a basic SYMLINK that
+/// `create_special` created.)
+const ERROR_IO_REPARSE_TAG_MISMATCH: u32 = 4393;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetFileAttributesExW, GetFileExInfoStandard, FileAttributeTagInfo,
     GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
@@ -61,7 +70,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA,
     MAXIMUM_REPARSE_DATA_BUFFER_SIZE, OPEN_EXISTING, WIN32_FILE_ATTRIBUTE_DATA,
 };
-use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
+use windows_sys::Win32::System::Ioctl::{
+    FSCTL_DELETE_REPARSE_POINT, FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT,
+};
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// `Metadata.generic_attributes` key under which captured reparse
@@ -337,6 +348,7 @@ pub fn apply(path: &Path, tag: u32, body: &[u8]) -> io::Result<()> {
     }
     let guard = HandleGuard(h);
     let mut bytes_returned: u32 = 0;
+    // First attempt: stamp the captured (tag, body) directly.
     // SAFETY: `full` is a heap-owned buffer of `full_len` bytes;
     // FSCTL_SET_REPARSE_POINT reads it and writes nothing back.
     let ok = unsafe {
@@ -351,13 +363,137 @@ pub fn apply(path: &Path, tag: u32, body: &[u8]) -> io::Result<()> {
             ptr::null_mut(),
         )
     };
+    if ok != 0 {
+        return Ok(());
+    }
+    // Tag-mismatch fallback: if the destination already has a
+    // reparse point with a different tag (e.g., create_special
+    // stamped a basic SYMLINK before this apply runs for a
+    // MOUNT_POINT capture), FSCTL_SET_REPARSE_POINT returns
+    // ERROR_IO_REPARSE_TAG_MISMATCH (4393). Delete the existing
+    // reparse data via FSCTL_DELETE_REPARSE_POINT, then retry.
+    // The delete IOCTL takes a 4-byte tag input (the existing tag
+    // — read via read_tag) and zero output.
+    let gle = unsafe { GetLastError() };
+    if gle != ERROR_IO_REPARSE_TAG_MISMATCH {
+        return Err(io::Error::new(
+            io::Error::from_raw_os_error(gle as i32).kind(),
+            format!(
+                "win_reparse::DeviceIoControl(SET_REPARSE_POINT, {}, tag={:#010x}) GLE={gle}",
+                path.display(),
+                tag,
+            ),
+        ));
+    }
+    drop(guard); // close the FILE_WRITE handle before re-opening
+    delete_existing(path)?;
+    // Re-open and retry the set.
+    let w2 = wide(path);
+    let h2 = unsafe {
+        CreateFileW(
+            w2.as_ptr(),
+            FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if h2 == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::Error::last_os_error().kind(),
+            format!(
+                "win_reparse::CreateFileW({}) for apply-retry: {:?}",
+                path.display(),
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    let guard2 = HandleGuard(h2);
+    let mut bytes_returned2: u32 = 0;
+    // SAFETY: same as above; `full` still owned.
+    let ok2 = unsafe {
+        DeviceIoControl(
+            guard2.0,
+            FSCTL_SET_REPARSE_POINT,
+            full.as_ptr().cast::<core::ffi::c_void>() as *mut _,
+            full_len as u32,
+            ptr::null_mut(),
+            0,
+            &mut bytes_returned2,
+            ptr::null_mut(),
+        )
+    };
+    if ok2 == 0 {
+        return Err(io::Error::new(
+            io::Error::last_os_error().kind(),
+            format!(
+                "win_reparse::DeviceIoControl(SET_REPARSE_POINT, {}, tag={:#010x}) after delete: {:?}",
+                path.display(),
+                tag,
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Delete whatever reparse data the destination currently carries.
+/// Reads the existing tag (the IOCTL needs a 4-byte input matching
+/// what's there), then calls FSCTL_DELETE_REPARSE_POINT. Used by
+/// [`apply`] to recover from ERROR_IO_REPARSE_TAG_MISMATCH when the
+/// destination was pre-stamped with a different tag.
+fn delete_existing(path: &Path) -> io::Result<()> {
+    let existing_tag = read_tag(path)?;
+    let w = wide(path);
+    let h = unsafe {
+        CreateFileW(
+            w.as_ptr(),
+            FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::Error::last_os_error().kind(),
+            format!(
+                "win_reparse::CreateFileW({}) for delete: {:?}",
+                path.display(),
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    let guard = HandleGuard(h);
+    // DELETE input is just the 8-byte fixed header with
+    // ReparseDataLength=0 (no body) and the existing tag.
+    let mut hdr = [0u8; REPARSE_HEADER_SIZE];
+    hdr[..4].copy_from_slice(&existing_tag.to_le_bytes());
+    // ReparseDataLength = 0 (already zero); Reserved = 0.
+    let mut bytes_returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            guard.0,
+            FSCTL_DELETE_REPARSE_POINT,
+            hdr.as_ptr().cast::<core::ffi::c_void>() as *mut _,
+            REPARSE_HEADER_SIZE as u32,
+            ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            ptr::null_mut(),
+        )
+    };
     if ok == 0 {
         return Err(io::Error::new(
             io::Error::last_os_error().kind(),
             format!(
-                "win_reparse::DeviceIoControl(SET_REPARSE_POINT, {}, tag={:#010x}): {:?}",
+                "win_reparse::DeviceIoControl(DELETE_REPARSE_POINT, {}, tag={:#010x}): {:?}",
                 path.display(),
-                tag,
+                existing_tag,
                 io::Error::last_os_error()
             ),
         ));

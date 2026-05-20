@@ -132,7 +132,27 @@ impl LocalSourceSaveOptions {
 
         let node = self.to_node(&entry, &m, meta)?;
         let path = entry.into_path();
-        let open = Some(OpenFile::new(path.clone()));
+        // 2c — reparse-tagged hosts (junctions, symlinks, WOF, CLOUD,
+        // APPEXECLINK, etc.) carry their full restorable state in
+        // `windows.reparse_point`; the host's body bytes are either
+        // unreadable (junctions, symlinks — wrong target opened),
+        // misleading (WOF — inflated content), or expensive
+        // (CLOUD — triggers hydration). Setting `open = None`
+        // signals "no content to read"; the archiver emits a
+        // content-less Node and the restore-side rebuilds via
+        // `set_generic_attributes`'s reparse branch (Task 5).
+        #[cfg(windows)]
+        let is_reparse_host = node
+            .meta
+            .generic_attributes
+            .contains_key(crate::backend::node::win_reparse::REPARSE_KEY);
+        #[cfg(not(windows))]
+        let is_reparse_host = false;
+        let open = if is_reparse_host {
+            None
+        } else {
+            Some(OpenFile::new(path.clone()))
+        };
         Ok(ReadSourceEntry { path, node, open })
     }
 
@@ -160,22 +180,26 @@ impl LocalSourceSaveOptions {
     }
 
     /// restic-compatible generic attributes for a path on Windows.
-    /// Captures the four supported keys —
+    /// Captures up to five keys —
     /// `windows.security_descriptor` (2a),
     /// `windows.file_attributes` (2b),
-    /// `windows.creation_time` (2b), and
-    /// `windows.sparse_extents` (2d, rustback-fork extension).
+    /// `windows.creation_time` (2b),
+    /// `windows.sparse_extents` (2d, rustback-fork extension), and
+    /// `windows.reparse_point` (2c, rustback-fork extension).
     /// Each is best-effort: any read failure leaves that key out,
     /// the others still go in.
     /// (kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b,
-    /// kopia-0dr.54 increment 2d.)
+    /// kopia-0dr.54 increment 2d, kopia-4rf increment 2c.)
     #[cfg(windows)]
     fn generic_attributes(
         path: &std::path::Path,
     ) -> std::collections::BTreeMap<String, crate::backend::node::GenericAttributeValue> {
         use crate::backend::node::{
-            generic_attributes, win_sd, win_sparse, GenericAttributeValue,
+            generic_attributes, win_reparse, win_sd, win_sparse, GenericAttributeValue,
+            ReparseBlob,
         };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
         let mut m = std::collections::BTreeMap::new();
         if let Some((attrs, ct)) =
             generic_attributes::capture::file_attributes_and_creation_time(path)
@@ -196,10 +220,10 @@ impl LocalSourceSaveOptions {
             );
         }
         // 2d sparse-extents capture: only emit the key for files
-        // genuinely flagged sparse on the source. A non-empty
-        // allocated-ranges list is required — empty would mean
-        // "fully sparse" and is degenerate for our purposes
-        // (no content to chunk).
+        // genuinely flagged sparse on the source. Reparse-tagged
+        // hosts are never sparse (NTFS doesn't allow both bits),
+        // so this also implicitly short-circuits the syscall for
+        // junctions / symlinks / cloud placeholders.
         if let Ok(true) = win_sparse::is_sparse_file(path) {
             if let Ok(runs) = win_sparse::enumerate_allocated_ranges(path) {
                 if !runs.is_empty() {
@@ -208,6 +232,27 @@ impl LocalSourceSaveOptions {
                     m.insert(
                         "windows.sparse_extents".to_string(),
                         GenericAttributeValue::SparseExtents(pairs),
+                    );
+                }
+            }
+        }
+        // 2c reparse-point capture: any host with
+        // FILE_ATTRIBUTE_REPARSE_POINT set gets its raw
+        // REPARSE_DATA_BUFFER body captured (sans the 8-byte fixed
+        // header — the tag is carried separately). On restore,
+        // FSCTL_SET_REPARSE_POINT rebuilds the buffer and stamps it
+        // onto the destination's pre-created host (file or empty dir).
+        // capture() opens with FILE_FLAG_OPEN_REPARSE_POINT so it
+        // never triggers OneDrive Files-On-Demand hydration.
+        if let Ok(true) = win_reparse::is_reparse_point(path) {
+            if let Ok((tag, body)) = win_reparse::capture(path) {
+                if !body.is_empty() {
+                    m.insert(
+                        win_reparse::REPARSE_KEY.to_string(),
+                        GenericAttributeValue::ReparsePoint(ReparseBlob {
+                            tag,
+                            data: B64.encode(&body),
+                        }),
                     );
                 }
             }
@@ -369,5 +414,128 @@ impl LocalSourceSaveOptions {
 
     fn to_node_other(self, name: &OsStr, _m: &std::fs::Metadata, meta: Metadata) -> Node {
         Node::new_node(name, NodeType::File, meta)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::backend::node::{win_reparse, GenericAttributeValue};
+    use std::process::Command;
+
+    fn stamp_junction(link: &Path, target: &Path) -> bool {
+        let status = Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status();
+        matches!(status, Ok(s) if s.success())
+    }
+
+    /// A plain file gets the four prior keys (creation_time,
+    /// file_attributes, optionally security_descriptor, optionally
+    /// sparse_extents) but NOT `windows.reparse_point`. Pins the
+    /// "absence-means-no-reparse" invariant — pre-2c-compatible
+    /// behaviour for normal files.
+    #[test]
+    fn generic_attributes_omits_reparse_for_plain_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("plain.txt");
+        std::fs::write(&p, b"hello").unwrap();
+        let m = LocalSourceSaveOptions::generic_attributes(&p);
+        assert!(
+            !m.contains_key(win_reparse::REPARSE_KEY),
+            "plain file should not carry windows.reparse_point, got keys: {:?}",
+            m.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A junction's `generic_attributes` carries
+    /// `windows.reparse_point` with `tag = IO_REPARSE_TAG_MOUNT_POINT`
+    /// and a non-empty `data` blob (base64-encoded). Pins the
+    /// capture-side wiring end to end.
+    #[test]
+    fn generic_attributes_captures_a_junction_reparse_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        if !stamp_junction(&link, &target) {
+            eprintln!("skipping: mklink /J not available in this env");
+            return;
+        }
+        let m = LocalSourceSaveOptions::generic_attributes(&link);
+        match m.get(win_reparse::REPARSE_KEY) {
+            Some(GenericAttributeValue::ReparsePoint(blob)) => {
+                assert_eq!(blob.tag, win_reparse::IO_REPARSE_TAG_MOUNT_POINT);
+                assert!(!blob.data.is_empty(), "reparse data must be non-empty");
+            }
+            other => panic!("expected ReparsePoint, got {other:?}"),
+        }
+    }
+
+    /// `map_entry` returns `open: None` for reparse-tagged hosts so
+    /// the file archiver doesn't try to read the host's body
+    /// (avoiding OneDrive Files-On-Demand hydration on CLOUD
+    /// placeholders, junction-target traversal, etc.). Pins the
+    /// invariant by driving the actual `map_entry` path via a
+    /// minimal `WalkBuilder` over a junction fixture.
+    #[test]
+    fn map_entry_sets_open_none_for_reparse_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        if !stamp_junction(&link, &target) {
+            eprintln!("skipping: mklink /J not available in this env");
+            return;
+        }
+        // Drive the same path map_entry takes: ignore::WalkBuilder
+        // produces a DirEntry, then LocalSourceSaveOptions::map_entry
+        // converts it to a ReadSourceEntry.
+        let mut walk = ignore::WalkBuilder::new(dir.path());
+        // Match the LocalSource defaults so the walker behaviour
+        // is the production one.
+        _ = walk
+            .follow_links(false)
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .require_git(false);
+        let mut found_link = false;
+        for de in walk.build().flatten() {
+            if de.path() == link {
+                let opts = LocalSourceSaveOptions::default();
+                let rse = opts.map_entry(de).expect("map_entry on junction");
+                assert!(
+                    rse.open.is_none(),
+                    "reparse-tagged host must have open=None"
+                );
+                assert!(
+                    rse.node
+                        .meta
+                        .generic_attributes
+                        .contains_key(win_reparse::REPARSE_KEY),
+                    "Node must carry windows.reparse_point"
+                );
+                // Modern Rust stdlib classifies junctions as Symlinks
+                // (PR rust-lang/rust#91335); pre-2022 stdlib classified
+                // them as Dirs. Either is acceptable for our purposes
+                // — what matters is the reparse_point blob and open=None.
+                assert!(
+                    matches!(
+                        rse.node.node_type,
+                        NodeType::Dir | NodeType::Symlink { .. }
+                    ),
+                    "junction classified as {:?}; expected Dir or Symlink",
+                    rse.node.node_type
+                );
+                found_link = true;
+                break;
+            }
+        }
+        assert!(found_link, "WalkBuilder did not yield the junction entry");
     }
 }

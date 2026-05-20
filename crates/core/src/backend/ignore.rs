@@ -329,6 +329,8 @@ impl ReadSource for LocalSource {
             save_opts: self.save_opts,
             #[cfg(windows)]
             pending_ads: std::collections::VecDeque::new(),
+            #[cfg(windows)]
+            reparse_skip: Vec::new(),
         }
     }
 }
@@ -349,6 +351,20 @@ pub struct LocalSourceWalker {
     /// the parent Tree's `Vec<Node>`. (kopia-0dr.53 increment 2b.)
     #[cfg(windows)]
     pending_ads: std::collections::VecDeque<RusticResult<ReadSourceEntry<OpenFile>>>,
+    /// Windows: filesystem-path prefixes of reparse-tagged directories
+    /// whose contents must be skipped during the walk. `ignore::Walk`
+    /// recurses into junctions (and other reparse-tagged directories)
+    /// because it sees them as regular Dirs via `Metadata::is_dir()`;
+    /// without this guard we would over-count by walking the
+    /// junction's target. Each time we emit a Dir Node carrying
+    /// `windows.reparse_point` we push its filesystem path here; the
+    /// next-loop skips any subsequent entry whose path is strictly
+    /// under one of these prefixes. Prefixes are popped lazily once
+    /// the walker leaves their subtree (depth-first walk order
+    /// guarantees this works without an explicit depth counter).
+    /// (kopia-4rf — increment 2c.)
+    #[cfg(windows)]
+    reparse_skip: Vec<PathBuf>,
 }
 
 impl Iterator for LocalSourceWalker {
@@ -362,40 +378,87 @@ impl Iterator for LocalSourceWalker {
             return Some(buffered);
         }
 
-        let item = match self.walker.next() {
-            // ignore root dir, i.e. an entry with depth 0 of type dir
-            Some(Ok(entry)) if entry.depth() == 0 && entry.file_type().unwrap().is_dir() => {
-                self.walker.next()
-            }
-            item => item,
-        }
-        .map(|e| {
-            self.save_opts
-                .map_entry(e.map_err(|err| {
-                    RusticError::with_source(
-                        ErrorKind::Internal,
-                        "Failed to get next entry from walk iterator.",
-                        err,
-                    )
-                    .ask_report()
-                })?)
-                .map_err(|err| {
-                    RusticError::with_source(
-                        ErrorKind::Internal,
-                        "Failed to map Directory entry to ReadSourceEntry.",
-                        err,
-                    )
-                    .ask_report()
-                })
-        });
+        // Loop until we yield a non-skipped entry (or run out of
+        // walker output). Skipping is needed only on Windows for
+        // descendants of reparse-tagged directories (kopia-4rf).
+        let item = loop {
+            let raw = match self.walker.next() {
+                // ignore root dir, i.e. an entry with depth 0 of type dir
+                Some(Ok(entry)) if entry.depth() == 0 && entry.file_type().unwrap().is_dir() => {
+                    self.walker.next()
+                }
+                item => item,
+            };
 
-        // Windows: after a regular File entry, enumerate any NTFS
-        // ADS attached to it and buffer one sibling entry per stream.
-        // Errors enumerating streams are non-fatal (warn + skip) —
-        // the host file's backup still proceeds normally.
+            // Windows reparse-point recursion guard: drop any entry
+            // strictly under an active reparse-skip prefix. Also
+            // pop prefixes the walker has already moved above.
+            #[cfg(windows)]
+            if let Some(Ok(ref de)) = raw {
+                let p = de.path();
+                // Pop any prefix whose subtree we've left.
+                self.reparse_skip.retain(|pfx| p.starts_with(pfx));
+                // Skip descendants (the prefix itself was emitted
+                // when we pushed it, so we only skip when `p != pfx`).
+                if self
+                    .reparse_skip
+                    .iter()
+                    .any(|pfx| p.starts_with(pfx) && p != pfx.as_path())
+                {
+                    continue;
+                }
+            }
+
+            break raw.map(|e| {
+                self.save_opts
+                    .map_entry(e.map_err(|err| {
+                        RusticError::with_source(
+                            ErrorKind::Internal,
+                            "Failed to get next entry from walk iterator.",
+                            err,
+                        )
+                        .ask_report()
+                    })?)
+                    .map_err(|err| {
+                        RusticError::with_source(
+                            ErrorKind::Internal,
+                            "Failed to map Directory entry to ReadSourceEntry.",
+                            err,
+                        )
+                        .ask_report()
+                    })
+            });
+        };
+
+        // Windows: after yielding an entry, decide whether to push
+        // it as a new reparse-skip prefix and/or to enumerate its
+        // NTFS Alternate Data Streams.
         #[cfg(windows)]
         if let Some(Ok(ref entry)) = item {
-            if matches!(entry.node.node_type, crate::backend::node::NodeType::File) {
+            use crate::backend::node::{win_reparse, NodeType};
+
+            // Reparse-tagged directories: junctions and other
+            // dir-shaped reparse points. Push the path so the walker
+            // doesn't follow into the link target. We don't need a
+            // similar guard for SYMLINK-tagged hosts because
+            // `WalkBuilder::follow_links(false)` already stops
+            // descent into real symlinks.
+            if matches!(entry.node.node_type, NodeType::Dir)
+                && entry
+                    .node
+                    .meta
+                    .generic_attributes
+                    .contains_key(win_reparse::REPARSE_KEY)
+            {
+                self.reparse_skip.push(entry.path.clone());
+            }
+
+            // After a regular File entry, enumerate any NTFS ADS
+            // attached to it and buffer one sibling entry per
+            // stream. Errors enumerating streams are non-fatal
+            // (warn + skip) — the host file's backup still proceeds
+            // normally.
+            if matches!(entry.node.node_type, NodeType::File) {
                 if let Some(ref open) = entry.open {
                     let host_path = open.path.clone();
                     let host_node = entry.node.clone();
