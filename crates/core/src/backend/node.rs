@@ -4,6 +4,8 @@ pub mod modification;
 pub(crate) mod win_ads;
 #[cfg(windows)]
 pub(crate) mod win_sd;
+#[cfg(windows)]
+pub(crate) mod win_sparse;
 
 pub use generic_attributes::{GenericAttributeValue, WindowsFiletime};
 

@@ -121,6 +121,10 @@ windows-sys = { version = "0.59", features = [
     # 2b: GetFileAttributesExW / SetFileAttributesW / SetFileTime / CreateFileW,
     # FindFirstStreamW for the ADS work.
     "Win32_Storage_FileSystem",
+    # 2d (kopia-0dr.54): DeviceIoControl + FSCTL_QUERY_ALLOCATED_RANGES /
+    # FSCTL_SET_SPARSE / FSCTL_SET_ZERO_DATA for NTFS sparse-file handling.
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
 ] }
 
 [target.'cfg(not(any(windows, target_os="openbsd")))'.dependencies]
