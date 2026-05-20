@@ -132,7 +132,7 @@ impl LocalSourceSaveOptions {
 
         let node = self.to_node(&entry, &m, meta)?;
         let path = entry.into_path();
-        let open = Some(OpenFile(path.clone()));
+        let open = Some(OpenFile::new(path.clone()));
         Ok(ReadSourceEntry { path, node, open })
     }
 
@@ -199,6 +199,38 @@ impl LocalSourceSaveOptions {
     ) -> std::collections::BTreeMap<String, crate::backend::node::GenericAttributeValue> {
         std::collections::BTreeMap::new()
     }
+}
+
+/// Build a Node that represents an NTFS ADS sibling of `host`. The
+/// new Node lives in the same parent directory's Tree as `host` and
+/// carries its own `content` blob refs (filled by the file
+/// archiver). Name shape is `format!("{host}:{stream}")`, matching
+/// restic PR #5171's wire form. ADS nodes do NOT carry their own
+/// `windows.*` generic attributes — those live on the host node;
+/// the stream itself is just a sequence of bytes.
+/// (kopia-0dr.53 increment 2b.)
+#[cfg(windows)]
+pub(super) fn ads_sibling_node(
+    host: &Node,
+    stream_name: &crate::backend::node::win_ads::AdsName,
+    stream_size: u64,
+) -> Node {
+    let mut node = host.clone();
+    // Replace the name with the colon-bearing ADS form. We use the
+    // host's already-escaped `name` field rather than re-running it
+    // through `escape_filename` — on Windows that's a no-op, and on
+    // non-Windows we don't get here. Stream names are validated by
+    // `AdsName::new` to be safe to splice with `:`.
+    node.name = format!("{}:{}", host.name, stream_name.as_str());
+    node.node_type = NodeType::File;
+    node.meta.size = stream_size;
+    // ADS streams are pure bytes; no per-node Windows metadata.
+    node.meta.generic_attributes = std::collections::BTreeMap::new();
+    // Each stream is chunked into its own content; cleared so the
+    // file_archiver fills it fresh from the stream's bytes.
+    node.content = None;
+    node.subtree = None;
+    node
 }
 
 #[cfg(not(windows))]

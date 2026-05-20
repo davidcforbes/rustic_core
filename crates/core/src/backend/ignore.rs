@@ -218,12 +218,48 @@ impl LocalSource {
 
 #[derive(Debug)]
 /// Describes an open file from the local backend.
-pub struct OpenFile(PathBuf);
+///
+/// On Windows, `stream` may be set to a named NTFS Alternate Data
+/// Stream of `path`; in that case `open()` appends `:<stream>:$DATA`
+/// to the path and `CreateFileW` (under `File::open`) opens the
+/// stream rather than the host file's body. See `node/win_ads.rs`
+/// and `LocalSourceWalker` for the ADS sibling-node mechanism
+/// (kopia-0dr.53 increment 2b).
+pub struct OpenFile {
+    path: PathBuf,
+    #[cfg(windows)]
+    stream: Option<String>,
+}
+
+impl OpenFile {
+    /// Open the host file's default data stream.
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            #[cfg(windows)]
+            stream: None,
+        }
+    }
+
+    /// Open a named NTFS Alternate Data Stream of the host file.
+    #[cfg(windows)]
+    pub(crate) fn for_stream(host: PathBuf, stream: String) -> Self {
+        Self {
+            path: host,
+            stream: Some(stream),
+        }
+    }
+}
 
 impl ReadSourceOpen for OpenFile {
     type Reader = File;
 
     /// Open the file from the local backend.
+    ///
+    /// On Windows, if `stream` is `Some`, the path is suffixed with
+    /// `:<stream>:$DATA` before being passed to `File::open`;
+    /// `CreateFileW` interprets that syntax and returns a handle to
+    /// the named NTFS ADS rather than the host file's body.
     ///
     /// # Returns
     ///
@@ -233,7 +269,19 @@ impl ReadSourceOpen for OpenFile {
     ///
     /// * If the file could not be opened.
     fn open(self) -> RusticResult<Self::Reader> {
-        let path = self.0;
+        #[cfg(windows)]
+        let path: PathBuf = if let Some(stream) = self.stream {
+            let mut p = self.path.into_os_string();
+            p.push(":");
+            p.push(&stream);
+            p.push(":$DATA");
+            PathBuf::from(p)
+        } else {
+            self.path
+        };
+        #[cfg(not(windows))]
+        let path: PathBuf = self.path;
+
         File::open(&path).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::InputOutput,
@@ -279,6 +327,8 @@ impl ReadSource for LocalSource {
         LocalSourceWalker {
             walker: self.builder.build(),
             save_opts: self.save_opts,
+            #[cfg(windows)]
+            pending_ads: std::collections::VecDeque::new(),
         }
     }
 }
@@ -290,13 +340,29 @@ pub struct LocalSourceWalker {
     walker: Walk,
     /// The save options to use.
     save_opts: LocalSourceSaveOptions,
+    /// Windows: NTFS Alternate Data Stream sibling entries buffered
+    /// for the next `next()` calls. Each regular-file entry yielded
+    /// by the underlying walker can produce N additional sibling
+    /// entries (one per named stream). The queue is FIFO so the host
+    /// file's entry is always yielded before its ADS siblings;
+    /// downstream `TreeArchiver::add_file` preserves that order in
+    /// the parent Tree's `Vec<Node>`. (kopia-0dr.53 increment 2b.)
+    #[cfg(windows)]
+    pending_ads: std::collections::VecDeque<RusticResult<ReadSourceEntry<OpenFile>>>,
 }
 
 impl Iterator for LocalSourceWalker {
     type Item = RusticResult<ReadSourceEntry<OpenFile>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.walker.next() {
+        // Drain buffered ADS siblings before pulling another walker
+        // entry. On non-Windows this branch is removed by the cfg.
+        #[cfg(windows)]
+        if let Some(buffered) = self.pending_ads.pop_front() {
+            return Some(buffered);
+        }
+
+        let item = match self.walker.next() {
             // ignore root dir, i.e. an entry with depth 0 of type dir
             Some(Ok(entry)) if entry.depth() == 0 && entry.file_type().unwrap().is_dir() => {
                 self.walker.next()
@@ -321,6 +387,46 @@ impl Iterator for LocalSourceWalker {
                     )
                     .ask_report()
                 })
-        })
+        });
+
+        // Windows: after a regular File entry, enumerate any NTFS
+        // ADS attached to it and buffer one sibling entry per stream.
+        // Errors enumerating streams are non-fatal (warn + skip) —
+        // the host file's backup still proceeds normally.
+        #[cfg(windows)]
+        if let Some(Ok(ref entry)) = item {
+            if matches!(entry.node.node_type, crate::backend::node::NodeType::File) {
+                if let Some(ref open) = entry.open {
+                    let host_path = open.path.clone();
+                    let host_node = entry.node.clone();
+                    match crate::backend::node::win_ads::enumerate(&host_path) {
+                        Ok(streams) => {
+                            for (stream_name, size) in streams {
+                                let ads_node = crate::backend::ignore::mapper::ads_sibling_node(
+                                    &host_node,
+                                    &stream_name,
+                                    size,
+                                );
+                                let ads_open = OpenFile::for_stream(
+                                    host_path.clone(),
+                                    stream_name.as_str().to_string(),
+                                );
+                                self.pending_ads.push_back(Ok(ReadSourceEntry {
+                                    path: host_path.clone(),
+                                    node: ads_node,
+                                    open: Some(ads_open),
+                                }));
+                            }
+                        }
+                        Err(err) => warn!(
+                            "ignoring ADS enumeration failure on {}: {err}",
+                            host_path.display()
+                        ),
+                    }
+                }
+            }
+        }
+
+        item
     }
 }
