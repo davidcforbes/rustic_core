@@ -491,11 +491,28 @@ impl LocalDestination {
             crate::backend::node::GenericAttributeValue,
         >,
     ) -> LocalDestinationResult<()> {
-        use crate::backend::node::{win_sd, GenericAttributeValue};
+        use crate::backend::node::{generic_attributes as ga, win_sd, GenericAttributeValue};
+        if generic_attributes.is_empty() {
+            return Ok(());
+        }
+        let path = self.path(item);
+        // Apply order: attrs (sets ReadOnly/Hidden cleanly without
+        // affecting later opens), creation_time (uses
+        // WRITE_ATTRIBUTES which works on ReadOnly), SD (DACL changes
+        // last so any privilege check sees the final state).
+        if let Some(GenericAttributeValue::U32(attrs)) =
+            generic_attributes.get("windows.file_attributes")
+        {
+            let _ = ga::apply::file_attributes(&path, *attrs);
+        }
+        if let Some(GenericAttributeValue::CreationTime(ct)) =
+            generic_attributes.get("windows.creation_time")
+        {
+            let _ = ga::apply::creation_time(&path, *ct);
+        }
         if let Some(GenericAttributeValue::String(b64)) =
             generic_attributes.get(win_sd::SD_KEY)
         {
-            let path = self.path(item);
             let _ = win_sd::apply(&path, b64);
         }
         Ok(())

@@ -104,6 +104,76 @@ impl PartialOrd for WindowsFiletime {
     }
 }
 
+/// Win32 apply of the two non-SD restic-supported generic attributes
+/// (kopia-0dr.53 — rustback-filecopy increment 2b).
+///
+/// `file_attributes` is applied via `SetFileAttributesW`;
+/// `creation_time` is applied via `SetFileTime` with only the
+/// creation slot non-null. Both are best-effort — the caller's
+/// existing `warn!`-and-continue path handles failures.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI; sealed inside this module.
+pub mod apply {
+    use super::WindowsFiletime;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, SetFileAttributesW, SetFileTime, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+        OPEN_EXISTING,
+    };
+
+    fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Returns `true` on success.
+    pub fn file_attributes(path: &Path, attrs: u32) -> bool {
+        let w = wide(path);
+        // SAFETY: `w` is a NUL-terminated UTF-16 buffer we own.
+        unsafe { SetFileAttributesW(w.as_ptr(), attrs) != 0 }
+    }
+
+    /// Returns `true` on success. Only the creation time is set;
+    /// access and modification times are left untouched (passing
+    /// null pointers signals "do not change" per MSDN).
+    pub fn creation_time(path: &Path, ct: WindowsFiletime) -> bool {
+        let w = wide(path);
+        let ft = FILETIME {
+            dwLowDateTime: ct.low_date_time,
+            dwHighDateTime: ct.high_date_time,
+        };
+        // SAFETY: `w` is a NUL-terminated UTF-16 buffer we own; the
+        // FILETIME is a POD struct on our stack; the handle is closed
+        // before this function returns.
+        unsafe {
+            // FILE_FLAG_BACKUP_SEMANTICS lets us open directories too,
+            // which is necessary because restic stores creation time
+            // for directories as well as files. FILE_WRITE_ATTRIBUTES
+            // is the minimum permission `SetFileTime` needs — using
+            // it alone (not FILE_GENERIC_WRITE) lets us open ReadOnly
+            // files, since ReadOnly blocks only FILE_WRITE_DATA opens.
+            let h = CreateFileW(
+                w.as_ptr(),
+                FILE_WRITE_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            );
+            if h == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            let ok = SetFileTime(h, &ft, ptr::null(), ptr::null()) != 0;
+            CloseHandle(h);
+            ok
+        }
+    }
+}
+
 /// Win32 capture of the two non-SD restic-supported generic attributes:
 /// `windows.file_attributes` (a `FILE_ATTRIBUTE_*` bitset) and
 /// `windows.creation_time` (a FILETIME). Both come from a single
@@ -238,6 +308,39 @@ mod tests {
             high_date_time: 1,
         };
         assert!(earlier < later);
+    }
+
+    /// Round-trip the two non-SD restic-supported attrs: apply
+    /// known values, then re-capture and require byte-equality.
+    /// Proves the apply path is the inverse of the capture path.
+    /// FILE_ATTRIBUTE_HIDDEN (0x2) | FILE_ATTRIBUTE_READONLY (0x1) =
+    /// 0x3 is the smallest distinctive bitset; FILE_ATTRIBUTE_ARCHIVE
+    /// (0x20) is set by NTFS on writes, so the post-write capture
+    /// will include it on top of what we set.
+    #[cfg(windows)]
+    #[test]
+    fn file_attributes_and_creation_time_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rt.bin");
+        std::fs::write(&p, b"x").unwrap();
+        // Apply: stamp ReadOnly+Hidden and a known historical FILETIME.
+        // 130645440000000000 = 2014-12-31T00:00:00Z in FILETIME ticks.
+        let want_ct = super::WindowsFiletime {
+            low_date_time: 0xC9FFD200,
+            high_date_time: 0x01D01CDB,
+        };
+        assert!(super::apply::file_attributes(&p, 0x1 | 0x2));
+        assert!(super::apply::creation_time(&p, want_ct));
+        // Re-capture.
+        let (got_attrs, got_ct) =
+            super::capture::file_attributes_and_creation_time(&p).unwrap();
+        // ReadOnly + Hidden survived; ARCHIVE may also be present.
+        assert!(
+            got_attrs & 0x3 == 0x3,
+            "ReadOnly+Hidden must round-trip, got {got_attrs:#x}"
+        );
+        // FILETIME has 100ns resolution; round-trip is byte-exact.
+        assert_eq!(got_ct, want_ct);
     }
 
     /// `capture::file_attributes_and_creation_time` reads both fields
