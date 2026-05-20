@@ -1,6 +1,9 @@
+pub mod generic_attributes;
 pub mod modification;
 #[cfg(windows)]
 pub(crate) mod win_sd;
+
+pub use generic_attributes::{GenericAttributeValue, WindowsFiletime};
 
 use std::{borrow::Cow, cmp::Ordering, ffi::OsStr, fmt::Debug, path::Path};
 
