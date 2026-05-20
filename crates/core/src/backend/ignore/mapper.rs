@@ -160,17 +160,22 @@ impl LocalSourceSaveOptions {
     }
 
     /// restic-compatible generic attributes for a path on Windows.
-    /// Captures the three restic-supported keys —
+    /// Captures the four supported keys —
     /// `windows.security_descriptor` (2a),
-    /// `windows.file_attributes` (2b), and
-    /// `windows.creation_time` (2b). Each is best-effort: any read
-    /// failure leaves that key out, the others still go in.
-    /// (kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b.)
+    /// `windows.file_attributes` (2b),
+    /// `windows.creation_time` (2b), and
+    /// `windows.sparse_extents` (2d, rustback-fork extension).
+    /// Each is best-effort: any read failure leaves that key out,
+    /// the others still go in.
+    /// (kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b,
+    /// kopia-0dr.54 increment 2d.)
     #[cfg(windows)]
     fn generic_attributes(
         path: &std::path::Path,
     ) -> std::collections::BTreeMap<String, crate::backend::node::GenericAttributeValue> {
-        use crate::backend::node::{generic_attributes, win_sd, GenericAttributeValue};
+        use crate::backend::node::{
+            generic_attributes, win_sd, win_sparse, GenericAttributeValue,
+        };
         let mut m = std::collections::BTreeMap::new();
         if let Some((attrs, ct)) =
             generic_attributes::capture::file_attributes_and_creation_time(path)
@@ -189,6 +194,23 @@ impl LocalSourceSaveOptions {
                 win_sd::SD_KEY.to_string(),
                 GenericAttributeValue::String(sd),
             );
+        }
+        // 2d sparse-extents capture: only emit the key for files
+        // genuinely flagged sparse on the source. A non-empty
+        // allocated-ranges list is required — empty would mean
+        // "fully sparse" and is degenerate for our purposes
+        // (no content to chunk).
+        if let Ok(true) = win_sparse::is_sparse_file(path) {
+            if let Ok(runs) = win_sparse::enumerate_allocated_ranges(path) {
+                if !runs.is_empty() {
+                    let pairs: Vec<[i64; 2]> =
+                        runs.into_iter().map(|(o, l)| [o, l]).collect();
+                    m.insert(
+                        "windows.sparse_extents".to_string(),
+                        GenericAttributeValue::SparseExtents(pairs),
+                    );
+                }
+            }
         }
         m
     }
