@@ -475,16 +475,19 @@ impl LocalDestination {
     }
 
     /// Apply restic generic attributes to `item`. On Windows this
-    /// Decodes the four Windows generic-attributes keys
+    /// Decodes the five Windows generic-attributes keys
     /// (`windows.security_descriptor`, `windows.file_attributes`,
-    /// `windows.creation_time`, `windows.sparse_extents`) and applies
-    /// each via its Win32 counterpart. Best-effort: a decode/apply
-    /// failure on any key is silently dropped (restore continues).
+    /// `windows.creation_time`, `windows.sparse_extents`,
+    /// `windows.reparse_point`) and applies each via its Win32
+    /// counterpart. Best-effort: a decode/apply failure on any key
+    /// is silently dropped (restore continues).
     /// Called from `commands::restore::set_metadata` AFTER all blob
     /// writes complete, which is the order the sparse-extents pass
-    /// needs (it punches holes in already-written zero ranges).
+    /// needs (it punches holes in already-written zero ranges) and
+    /// the reparse-point pass needs (the host file or directory
+    /// must exist before FSCTL_SET_REPARSE_POINT can stamp it).
     /// kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b,
-    /// kopia-0dr.54 increment 2d.
+    /// kopia-0dr.54 increment 2d, kopia-4rf increment 2c.
     #[cfg(windows)]
     pub(crate) fn set_generic_attributes(
         &self,
@@ -495,8 +498,10 @@ impl LocalDestination {
         >,
     ) -> LocalDestinationResult<()> {
         use crate::backend::node::{
-            generic_attributes as ga, win_sd, win_sparse, GenericAttributeValue,
+            generic_attributes as ga, win_reparse, win_sd, win_sparse, GenericAttributeValue,
         };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
         if generic_attributes.is_empty() {
             return Ok(());
         }
@@ -513,6 +518,13 @@ impl LocalDestination {
         //     ReadOnly.
         //  4. security_descriptor — DACL changes last so any privilege
         //     check sees the final state.
+        //  5. reparse_point — LAST because FSCTL_SET_REPARSE_POINT
+        //     requires the file/dir to exist with its content/
+        //     attributes already in place. For SYMLINK captures the
+        //     destination may already be a basic symlink (stamped
+        //     by create_special) with a different reparse tag;
+        //     win_reparse::apply handles ERROR_IO_REPARSE_TAG_MISMATCH
+        //     by deleting the existing reparse data and retrying.
         if let Some(GenericAttributeValue::SparseExtents(extents)) =
             generic_attributes.get("windows.sparse_extents")
         {
@@ -534,6 +546,13 @@ impl LocalDestination {
             generic_attributes.get(win_sd::SD_KEY)
         {
             let _ = win_sd::apply(&path, b64);
+        }
+        if let Some(GenericAttributeValue::ReparsePoint(blob)) =
+            generic_attributes.get(win_reparse::REPARSE_KEY)
+        {
+            if let Ok(body) = B64.decode(&blob.data) {
+                let _ = win_reparse::apply(&path, blob.tag, &body);
+            }
         }
         Ok(())
     }
