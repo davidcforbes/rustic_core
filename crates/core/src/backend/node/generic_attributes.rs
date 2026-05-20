@@ -32,13 +32,30 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-/// One restic `generic_attributes` value — covers every shape restic
-/// v0.18.1 actually emits, and parses any of them transparently.
+/// One `generic_attributes` value — covers every shape restic
+/// v0.18.1 emits, plus rustback-fork extensions (sparse extents),
+/// and parses any of them transparently.
+///
+/// Variant order matters for `#[serde(untagged)]` — serde tries
+/// each variant top-down and the first match wins. The shapes
+/// here are unambiguous (object / array / number / string) so any
+/// order would parse correctly, but keeping the most specific
+/// shapes first makes the resolution order easy to reason about.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GenericAttributeValue {
     /// `windows.creation_time` — the FILETIME of the file's creation.
+    /// JSON object `{"LowDateTime": N, "HighDateTime": N}`.
     CreationTime(WindowsFiletime),
+    /// `windows.sparse_extents` — the source's NTFS allocated runs.
+    /// JSON array of `[file_offset, length]` `i64` pairs, e.g.
+    /// `[[0, 4096], [524288, 524288]]`. **Rustback fork extension**
+    /// (kopia-0dr.54 increment 2d) — restic v0.18.1 does not emit
+    /// or parse this key; tree blobs carrying it stay
+    /// upstream-readable because restic's
+    /// `map[GenericAttributeType]json.RawMessage` preserves unknown
+    /// keys verbatim.
+    SparseExtents(Vec<[i64; 2]>),
     /// `windows.file_attributes` — `FILE_ATTRIBUTE_*` bitset.
     U32(u32),
     /// `windows.security_descriptor` — base64 of the self-relative SD.
@@ -66,13 +83,15 @@ impl Ord for GenericAttributeValue {
         fn rank(v: &GenericAttributeValue) -> u8 {
             match v {
                 GenericAttributeValue::CreationTime(_) => 0,
-                GenericAttributeValue::U32(_) => 1,
-                GenericAttributeValue::String(_) => 2,
+                GenericAttributeValue::SparseExtents(_) => 1,
+                GenericAttributeValue::U32(_) => 2,
+                GenericAttributeValue::String(_) => 3,
             }
         }
         match rank(self).cmp(&rank(other)) {
             Ordering::Equal => match (self, other) {
                 (Self::CreationTime(a), Self::CreationTime(b)) => a.cmp(b),
+                (Self::SparseExtents(a), Self::SparseExtents(b)) => a.cmp(b),
                 (Self::U32(a), Self::U32(b)) => a.cmp(b),
                 (Self::String(a), Self::String(b)) => a.cmp(b),
                 // The same `rank` implies the same variant pair.
@@ -231,8 +250,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// The on-disk shape must be byte-identical to what restic v0.18.1
-    /// emits for the same three keys. Restic-format compatibility for
-    /// 2b hinges on this test (and its bit-compat oracle in
+    /// emits for the same three keys, plus our forward-compat
+    /// `windows.sparse_extents` extension. Restic-format compatibility
+    /// for 2b/2d hinges on this test (and its bit-compat oracle in
     /// `rustback-filecopy`).
     #[test]
     fn restic_wire_shape_is_byte_identical() {
@@ -252,11 +272,36 @@ mod tests {
             "windows.security_descriptor".into(),
             GenericAttributeValue::String("AQAEh==".into()),
         );
+        m.insert(
+            "windows.sparse_extents".into(),
+            GenericAttributeValue::SparseExtents(vec![[0, 4096], [524288, 524288]]),
+        );
         let json = serde_json::to_string(&m).unwrap();
+        // BTreeMap ordering is lex-byte-order of keys; same as Go's
+        // encoding/json map-key sort. Order: creation_time,
+        // file_attributes, security_descriptor, sparse_extents.
         assert_eq!(
             json,
-            r#"{"windows.creation_time":{"LowDateTime":2864434397,"HighDateTime":287454020},"windows.file_attributes":34,"windows.security_descriptor":"AQAEh=="}"#
+            r#"{"windows.creation_time":{"LowDateTime":2864434397,"HighDateTime":287454020},"windows.file_attributes":34,"windows.security_descriptor":"AQAEh==","windows.sparse_extents":[[0,4096],[524288,524288]]}"#
         );
+    }
+
+    /// Forward-compat: a tree blob produced by 2d (carrying
+    /// `windows.sparse_extents`) deserialises cleanly and re-emits
+    /// byte-identically. Also covers the round-trip of an empty
+    /// extents array, since the helper guards against emission of an
+    /// empty list — but parsing must still tolerate one.
+    #[test]
+    fn sparse_extents_round_trip_through_the_carrier() {
+        let original = r#"{"windows.sparse_extents":[[100,200],[400,800]]}"#;
+        let m: BTreeMap<String, GenericAttributeValue> =
+            serde_json::from_str(original).unwrap();
+        assert!(matches!(
+            m.get("windows.sparse_extents"),
+            Some(GenericAttributeValue::SparseExtents(v)) if v == &vec![[100i64, 200], [400, 800]]
+        ));
+        let re_emitted = serde_json::to_string(&m).unwrap();
+        assert_eq!(re_emitted, original);
     }
 
     /// Forward-read 2a's wire format: a tree blob produced by 2a
@@ -283,16 +328,21 @@ mod tests {
             low_date_time: 0,
             high_date_time: 0,
         });
+        let sx = GenericAttributeValue::SparseExtents(vec![[0, 4]]);
         let n = GenericAttributeValue::U32(1);
         let s = GenericAttributeValue::String("z".into());
-        // Variant ranks: CreationTime < U32 < String.
-        assert!(ct < n);
+        // Variant ranks: CreationTime < SparseExtents < U32 < String.
+        assert!(ct < sx);
+        assert!(sx < n);
         assert!(n < s);
         // Reflexive.
         assert_eq!(ct.cmp(&ct), Ordering::Equal);
+        assert_eq!(sx.cmp(&sx), Ordering::Equal);
         // Same variant — compare content.
         let n2 = GenericAttributeValue::U32(2);
         assert!(n < n2);
+        let sx2 = GenericAttributeValue::SparseExtents(vec![[0, 4], [8, 4]]);
+        assert!(sx < sx2);
     }
 
     /// `WindowsFiletime` ordering follows the chronological order of
@@ -376,6 +426,13 @@ mod tests {
         let v: GenericAttributeValue =
             serde_json::from_str(r#"{"LowDateTime":1,"HighDateTime":2}"#).unwrap();
         assert!(matches!(v, GenericAttributeValue::CreationTime(_)));
+
+        let v: GenericAttributeValue =
+            serde_json::from_str(r#"[[0,4096],[8192,4096]]"#).unwrap();
+        assert!(matches!(
+            v,
+            GenericAttributeValue::SparseExtents(ref e) if e == &vec![[0i64,4096],[8192,4096]]
+        ));
 
         let v: GenericAttributeValue = serde_json::from_str("42").unwrap();
         assert!(matches!(v, GenericAttributeValue::U32(42)));
