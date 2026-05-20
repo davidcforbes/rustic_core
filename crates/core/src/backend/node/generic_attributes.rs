@@ -104,6 +104,57 @@ impl PartialOrd for WindowsFiletime {
     }
 }
 
+/// Win32 capture of the two non-SD restic-supported generic attributes:
+/// `windows.file_attributes` (a `FILE_ATTRIBUTE_*` bitset) and
+/// `windows.creation_time` (a FILETIME). Both come from a single
+/// `GetFileAttributesExW` call — read-only, no privileges required.
+///
+/// Returns `None` if the file has been deleted between the directory
+/// walk and the call. Failures are silent for the same reason 2a's
+/// SD capture is silent: best-effort, the caller logs and continues.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI; sealed inside this module.
+pub mod capture {
+    use super::WindowsFiletime;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA,
+    };
+
+    fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Returns `(file_attributes, creation_time)` for `path`. Both
+    /// fields come from one `GetFileAttributesExW` call.
+    pub fn file_attributes_and_creation_time(
+        path: &Path,
+    ) -> Option<(u32, WindowsFiletime)> {
+        let w = wide(path);
+        // SAFETY: `w` is a NUL-terminated UTF-16 buffer owned by us;
+        // `data` is a stack-allocated POD struct written by the API.
+        unsafe {
+            let mut data: WIN32_FILE_ATTRIBUTE_DATA = std::mem::zeroed();
+            let ok = GetFileAttributesExW(
+                w.as_ptr(),
+                GetFileExInfoStandard,
+                std::ptr::from_mut::<WIN32_FILE_ATTRIBUTE_DATA>(&mut data).cast(),
+            );
+            if ok == 0 {
+                return None;
+            }
+            Some((
+                data.dwFileAttributes,
+                WindowsFiletime {
+                    low_date_time: data.ftCreationTime.dwLowDateTime,
+                    high_date_time: data.ftCreationTime.dwHighDateTime,
+                },
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +238,30 @@ mod tests {
             high_date_time: 1,
         };
         assert!(earlier < later);
+    }
+
+    /// `capture::file_attributes_and_creation_time` reads both fields
+    /// off a real file via `GetFileAttributesExW`. Smoke test: a
+    /// freshly created file has a non-zero creation time and the
+    /// returned attribute bitset is small enough to fit `u32` (it
+    /// always does, since that's the Win32 type).
+    #[cfg(windows)]
+    #[test]
+    fn capture_reads_attributes_and_creation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("probe.txt");
+        std::fs::write(&p, b"x").unwrap();
+        let (attrs, ct) = super::capture::file_attributes_and_creation_time(&p)
+            .expect("GetFileAttributesExW must succeed on a just-created file");
+        // FILE_ATTRIBUTE_ARCHIVE (0x20) is set by NTFS on every new
+        // file. Other flags may be present too; just assert the
+        // archive bit is on as a sanity check that we read real data.
+        assert!(attrs & 0x20 != 0, "expected ARCHIVE bit, got {attrs:#x}");
+        // A real FILETIME is never zero for a file that exists.
+        assert!(
+            ct.low_date_time != 0 || ct.high_date_time != 0,
+            "creation time must be non-zero"
+        );
     }
 
     /// An object-shaped value parses as `CreationTime`; a number as

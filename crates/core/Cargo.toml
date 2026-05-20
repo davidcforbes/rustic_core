@@ -118,6 +118,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    # 2b: GetFileAttributesExW / SetFileAttributesW / SetFileTime / CreateFileW,
+    # FindFirstStreamW for the ADS work.
+    "Win32_Storage_FileSystem",
 ] }
 
 [target.'cfg(not(any(windows, target_os="openbsd")))'.dependencies]

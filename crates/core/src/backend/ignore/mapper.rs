@@ -159,19 +159,34 @@ impl LocalSourceSaveOptions {
         Ok(node)
     }
 
-    /// restic-compatible generic attributes for a path. On Windows
-    /// this captures the security descriptor (kopia-0dr.39 inc 2a);
-    /// 2b will add file-attributes and creation-time on top of this
-    /// scaffold. Elsewhere the map is empty.
+    /// restic-compatible generic attributes for a path on Windows.
+    /// Captures the three restic-supported keys —
+    /// `windows.security_descriptor` (2a),
+    /// `windows.file_attributes` (2b), and
+    /// `windows.creation_time` (2b). Each is best-effort: any read
+    /// failure leaves that key out, the others still go in.
+    /// (kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b.)
     #[cfg(windows)]
     fn generic_attributes(
         path: &std::path::Path,
     ) -> std::collections::BTreeMap<String, crate::backend::node::GenericAttributeValue> {
-        use crate::backend::node::GenericAttributeValue;
+        use crate::backend::node::{generic_attributes, win_sd, GenericAttributeValue};
         let mut m = std::collections::BTreeMap::new();
-        if let Some(sd) = crate::backend::node::win_sd::capture(path) {
+        if let Some((attrs, ct)) =
+            generic_attributes::capture::file_attributes_and_creation_time(path)
+        {
             m.insert(
-                crate::backend::node::win_sd::SD_KEY.to_string(),
+                "windows.creation_time".to_string(),
+                GenericAttributeValue::CreationTime(ct),
+            );
+            m.insert(
+                "windows.file_attributes".to_string(),
+                GenericAttributeValue::U32(attrs),
+            );
+        }
+        if let Some(sd) = win_sd::capture(path) {
+            m.insert(
+                win_sd::SD_KEY.to_string(),
                 GenericAttributeValue::String(sd),
             );
         }
