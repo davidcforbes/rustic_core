@@ -3,11 +3,13 @@ pub mod modification;
 #[cfg(windows)]
 pub(crate) mod win_ads;
 #[cfg(windows)]
+pub(crate) mod win_reparse;
+#[cfg(windows)]
 pub(crate) mod win_sd;
 #[cfg(windows)]
 pub(crate) mod win_sparse;
 
-pub use generic_attributes::{GenericAttributeValue, WindowsFiletime};
+pub use generic_attributes::{GenericAttributeValue, ReparseBlob, WindowsFiletime};
 
 use std::{borrow::Cow, cmp::Ordering, ffi::OsStr, fmt::Debug, path::Path};
 
