@@ -1,5 +1,6 @@
 //! Restic-compatible value carrier for `Metadata.generic_attributes`
-//! (kopia-0dr.53 — rustback-filecopy increment 2b).
+//! (kopia-0dr.53 — rustback-filecopy increment 2b, extended for 2d
+//! and 2c).
 //!
 //! Restic's tree-blob wire format stores Windows per-node metadata as
 //! `map[GenericAttributeType]json.RawMessage`. The three keys it
@@ -10,6 +11,14 @@
 //! | `windows.security_descriptor` | JSON string (base64 of self-relative SD bytes) |
 //! | `windows.file_attributes`     | JSON number (FILE_ATTRIBUTE_* bitset, fits `u32`) |
 //! | `windows.creation_time`       | JSON object `{"LowDateTime":N,"HighDateTime":N}` |
+//!
+//! The rustback fork adds two forward-compat keys not in upstream
+//! restic v0.18.1:
+//!
+//! | Key | JSON value shape | Increment |
+//! |---|---|---|
+//! | `windows.sparse_extents` | JSON array `[[offset,length], ...]` | 2d (kopia-0dr.54) |
+//! | `windows.reparse_point`  | JSON object `{"tag":N,"data":"<b64>"}` | 2c (kopia-4rf) |
 //!
 //! Increment 2a carried only the SD entry, so a `BTreeMap<String,
 //! String>` sufficed. 2b adds the other two keys, whose natural JSON
@@ -47,6 +56,15 @@ pub enum GenericAttributeValue {
     /// `windows.creation_time` — the FILETIME of the file's creation.
     /// JSON object `{"LowDateTime": N, "HighDateTime": N}`.
     CreationTime(WindowsFiletime),
+    /// `windows.reparse_point` — opaque NTFS reparse-point data for
+    /// junctions / symlinks / OneDrive placeholders / WOF /
+    /// APPEXECLINK / etc. JSON object `{"tag": N, "data": "<b64>"}`
+    /// where `tag` is the `IO_REPARSE_TAG_*` value and `data` is
+    /// base64 of the `REPARSE_DATA_BUFFER` body (the bytes after
+    /// the 8-byte fixed header). **Rustback fork extension**
+    /// (kopia-4rf increment 2c) — restic v0.18.1 does not emit
+    /// or parse this key.
+    ReparsePoint(ReparseBlob),
     /// `windows.sparse_extents` — the source's NTFS allocated runs.
     /// JSON array of `[file_offset, length]` `i64` pairs, e.g.
     /// `[[0, 4096], [524288, 524288]]`. **Rustback fork extension**
@@ -75,6 +93,25 @@ pub struct WindowsFiletime {
     pub high_date_time: u32,
 }
 
+/// Rustback fork wire shape for an NTFS reparse point (kopia-4rf,
+/// increment 2c). `tag` is the `IO_REPARSE_TAG_*` value; `data` is
+/// base64 of the `REPARSE_DATA_BUFFER` body — the bytes immediately
+/// following the 8-byte fixed header (`ReparseTag` + `ReparseDataLength`
+/// + `Reserved`). The header is reconstructed at apply-time: `tag` is
+/// carried in the sibling field, `ReparseDataLength` equals
+/// `data.len()` after base64 decode, and `Reserved` is zero.
+///
+/// Lower-case JSON field names because this is a fork extension, not
+/// a restic-defined shape — no Go-marshalling alignment constraint.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct ReparseBlob {
+    /// `IO_REPARSE_TAG_*` value (e.g. `0xA0000003` for MOUNT_POINT,
+    /// `0xA000000C` for SYMLINK).
+    pub tag: u32,
+    /// Base64-encoded `REPARSE_DATA_BUFFER` body bytes (no header).
+    pub data: String,
+}
+
 impl Ord for GenericAttributeValue {
     /// Total order: by variant tag first (matching declaration
     /// discriminants), then by content. Stable, deterministic, and
@@ -83,14 +120,16 @@ impl Ord for GenericAttributeValue {
         fn rank(v: &GenericAttributeValue) -> u8 {
             match v {
                 GenericAttributeValue::CreationTime(_) => 0,
-                GenericAttributeValue::SparseExtents(_) => 1,
-                GenericAttributeValue::U32(_) => 2,
-                GenericAttributeValue::String(_) => 3,
+                GenericAttributeValue::ReparsePoint(_) => 1,
+                GenericAttributeValue::SparseExtents(_) => 2,
+                GenericAttributeValue::U32(_) => 3,
+                GenericAttributeValue::String(_) => 4,
             }
         }
         match rank(self).cmp(&rank(other)) {
             Ordering::Equal => match (self, other) {
                 (Self::CreationTime(a), Self::CreationTime(b)) => a.cmp(b),
+                (Self::ReparsePoint(a), Self::ReparsePoint(b)) => a.cmp(b),
                 (Self::SparseExtents(a), Self::SparseExtents(b)) => a.cmp(b),
                 (Self::U32(a), Self::U32(b)) => a.cmp(b),
                 (Self::String(a), Self::String(b)) => a.cmp(b),
@@ -118,6 +157,21 @@ impl Ord for WindowsFiletime {
 }
 
 impl PartialOrd for WindowsFiletime {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReparseBlob {
+    /// Lexicographic over `(tag, data)`. Stable and total for any
+    /// pair of blobs; ties on tag fall through to byte-wise data
+    /// comparison.
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.tag, &self.data).cmp(&(other.tag, &other.data))
+    }
+}
+
+impl PartialOrd for ReparseBlob {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -251,9 +305,9 @@ mod tests {
 
     /// The on-disk shape must be byte-identical to what restic v0.18.1
     /// emits for the same three keys, plus our forward-compat
-    /// `windows.sparse_extents` extension. Restic-format compatibility
-    /// for 2b/2d hinges on this test (and its bit-compat oracle in
-    /// `rustback-filecopy`).
+    /// `windows.sparse_extents` (2d) and `windows.reparse_point` (2c)
+    /// extensions. Restic-format compatibility for 2b/2c/2d hinges
+    /// on this test (and its bit-compat oracle in `rustback-filecopy`).
     #[test]
     fn restic_wire_shape_is_byte_identical() {
         let mut m: BTreeMap<String, GenericAttributeValue> = BTreeMap::new();
@@ -269,6 +323,13 @@ mod tests {
             GenericAttributeValue::U32(0x22),
         );
         m.insert(
+            "windows.reparse_point".into(),
+            GenericAttributeValue::ReparsePoint(ReparseBlob {
+                tag: 0xA0000003, // IO_REPARSE_TAG_MOUNT_POINT
+                data: "AAEC".into(),
+            }),
+        );
+        m.insert(
             "windows.security_descriptor".into(),
             GenericAttributeValue::String("AQAEh==".into()),
         );
@@ -279,11 +340,32 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         // BTreeMap ordering is lex-byte-order of keys; same as Go's
         // encoding/json map-key sort. Order: creation_time,
-        // file_attributes, security_descriptor, sparse_extents.
+        // file_attributes, reparse_point, security_descriptor,
+        // sparse_extents.
         assert_eq!(
             json,
-            r#"{"windows.creation_time":{"LowDateTime":2864434397,"HighDateTime":287454020},"windows.file_attributes":34,"windows.security_descriptor":"AQAEh==","windows.sparse_extents":[[0,4096],[524288,524288]]}"#
+            r#"{"windows.creation_time":{"LowDateTime":2864434397,"HighDateTime":287454020},"windows.file_attributes":34,"windows.reparse_point":{"tag":2684354563,"data":"AAEC"},"windows.security_descriptor":"AQAEh==","windows.sparse_extents":[[0,4096],[524288,524288]]}"#
         );
+    }
+
+    /// Forward-compat: a tree blob produced by 2c (carrying
+    /// `windows.reparse_point`) deserialises cleanly and re-emits
+    /// byte-identically. Pins both the field order in `ReparseBlob`
+    /// (`tag` before `data`) and that the variant resolves through
+    /// `#[serde(untagged)]`.
+    #[test]
+    fn reparse_point_round_trip_through_the_carrier() {
+        let original =
+            r#"{"windows.reparse_point":{"tag":2684354572,"data":"FAA8AAAAOAAFAAAA"}}"#;
+        let m: BTreeMap<String, GenericAttributeValue> =
+            serde_json::from_str(original).unwrap();
+        assert!(matches!(
+            m.get("windows.reparse_point"),
+            Some(GenericAttributeValue::ReparsePoint(b))
+                if b.tag == 0xA000000C && b.data == "FAA8AAAAOAAFAAAA"
+        ));
+        let re_emitted = serde_json::to_string(&m).unwrap();
+        assert_eq!(re_emitted, original);
     }
 
     /// Forward-compat: a tree blob produced by 2d (carrying
@@ -328,21 +410,48 @@ mod tests {
             low_date_time: 0,
             high_date_time: 0,
         });
+        let rp = GenericAttributeValue::ReparsePoint(ReparseBlob {
+            tag: 0xA0000003,
+            data: "AA==".into(),
+        });
         let sx = GenericAttributeValue::SparseExtents(vec![[0, 4]]);
         let n = GenericAttributeValue::U32(1);
         let s = GenericAttributeValue::String("z".into());
-        // Variant ranks: CreationTime < SparseExtents < U32 < String.
-        assert!(ct < sx);
+        // Variant ranks: CreationTime < ReparsePoint < SparseExtents
+        //              < U32 < String.
+        assert!(ct < rp);
+        assert!(rp < sx);
         assert!(sx < n);
         assert!(n < s);
         // Reflexive.
         assert_eq!(ct.cmp(&ct), Ordering::Equal);
+        assert_eq!(rp.cmp(&rp), Ordering::Equal);
         assert_eq!(sx.cmp(&sx), Ordering::Equal);
         // Same variant — compare content.
         let n2 = GenericAttributeValue::U32(2);
         assert!(n < n2);
         let sx2 = GenericAttributeValue::SparseExtents(vec![[0, 4], [8, 4]]);
         assert!(sx < sx2);
+        // Same variant for reparse: tag comparison wins over data.
+        let rp_smaller_tag = GenericAttributeValue::ReparsePoint(ReparseBlob {
+            tag: 0xA0000003,
+            data: "AA==".into(),
+        });
+        let rp_bigger_tag = GenericAttributeValue::ReparsePoint(ReparseBlob {
+            tag: 0xA000000C,
+            data: "AA==".into(),
+        });
+        assert!(rp_smaller_tag < rp_bigger_tag);
+        // Same tag: data is the tiebreaker.
+        let rp_data_a = GenericAttributeValue::ReparsePoint(ReparseBlob {
+            tag: 0xA0000003,
+            data: "AAA=".into(),
+        });
+        let rp_data_b = GenericAttributeValue::ReparsePoint(ReparseBlob {
+            tag: 0xA0000003,
+            data: "AAB=".into(),
+        });
+        assert!(rp_data_a < rp_data_b);
     }
 
     /// `WindowsFiletime` ordering follows the chronological order of
@@ -417,15 +526,25 @@ mod tests {
         );
     }
 
-    /// An object-shaped value parses as `CreationTime`; a number as
-    /// `U32`; a string as `String`. The variant order in the enum is
-    /// the order serde tries — placing `CreationTime` first ensures
-    /// objects can never fall through to a wrong variant.
+    /// An object-shaped value parses as `CreationTime` or
+    /// `ReparsePoint` depending on its keys; an array as
+    /// `SparseExtents`; a number as `U32`; a string as `String`. The
+    /// two object variants have disjoint required-field sets
+    /// (`LowDateTime/HighDateTime` vs `tag/data`), so serde resolves
+    /// them unambiguously regardless of declaration order.
     #[test]
     fn untagged_variant_resolution_is_unambiguous_for_each_shape() {
         let v: GenericAttributeValue =
             serde_json::from_str(r#"{"LowDateTime":1,"HighDateTime":2}"#).unwrap();
         assert!(matches!(v, GenericAttributeValue::CreationTime(_)));
+
+        let v: GenericAttributeValue =
+            serde_json::from_str(r#"{"tag":2684354572,"data":"AAEC"}"#).unwrap();
+        assert!(matches!(
+            v,
+            GenericAttributeValue::ReparsePoint(ref b)
+                if b.tag == 0xA000000C && b.data == "AAEC"
+        ));
 
         let v: GenericAttributeValue =
             serde_json::from_str(r#"[[0,4096],[8192,4096]]"#).unwrap();
