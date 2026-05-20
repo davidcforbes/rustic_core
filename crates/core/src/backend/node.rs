@@ -1,6 +1,8 @@
 pub mod generic_attributes;
 pub mod modification;
 #[cfg(windows)]
+pub(crate) mod win_ads;
+#[cfg(windows)]
 pub(crate) mod win_sd;
 
 pub use generic_attributes::{GenericAttributeValue, WindowsFiletime};
