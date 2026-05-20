@@ -161,14 +161,19 @@ impl LocalSourceSaveOptions {
 
     /// restic-compatible generic attributes for a path. On Windows
     /// this captures the security descriptor (kopia-0dr.39 inc 2a);
-    /// elsewhere it is empty.
+    /// 2b will add file-attributes and creation-time on top of this
+    /// scaffold. Elsewhere the map is empty.
     #[cfg(windows)]
     fn generic_attributes(
         path: &std::path::Path,
-    ) -> std::collections::BTreeMap<String, String> {
+    ) -> std::collections::BTreeMap<String, crate::backend::node::GenericAttributeValue> {
+        use crate::backend::node::GenericAttributeValue;
         let mut m = std::collections::BTreeMap::new();
         if let Some(sd) = crate::backend::node::win_sd::capture(path) {
-            m.insert(crate::backend::node::win_sd::SD_KEY.to_string(), sd);
+            m.insert(
+                crate::backend::node::win_sd::SD_KEY.to_string(),
+                GenericAttributeValue::String(sd),
+            );
         }
         m
     }
@@ -176,7 +181,7 @@ impl LocalSourceSaveOptions {
     #[cfg(not(windows))]
     fn generic_attributes(
         _path: &std::path::Path,
-    ) -> std::collections::BTreeMap<String, String> {
+    ) -> std::collections::BTreeMap<String, crate::backend::node::GenericAttributeValue> {
         std::collections::BTreeMap::new()
     }
 }

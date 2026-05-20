@@ -479,15 +479,22 @@ impl LocalDestination {
     /// `generic_attributes["windows.security_descriptor"]` (base64)
     /// and applies it via `SetNamedSecurityInfoW`. Best-effort: a
     /// decode/apply failure is silently dropped (restore continues).
-    /// kopia-0dr.39 increment 2a.
+    /// 2b will widen the dispatch to also handle the file-attributes
+    /// and creation-time keys.
+    /// kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b.
     #[cfg(windows)]
     pub(crate) fn set_generic_attributes(
         &self,
         item: impl AsRef<Path>,
-        generic_attributes: &std::collections::BTreeMap<String, String>,
+        generic_attributes: &std::collections::BTreeMap<
+            String,
+            crate::backend::node::GenericAttributeValue,
+        >,
     ) -> LocalDestinationResult<()> {
-        use crate::backend::node::win_sd;
-        if let Some(b64) = generic_attributes.get(win_sd::SD_KEY) {
+        use crate::backend::node::{win_sd, GenericAttributeValue};
+        if let Some(GenericAttributeValue::String(b64)) =
+            generic_attributes.get(win_sd::SD_KEY)
+        {
             let path = self.path(item);
             let _ = win_sd::apply(&path, b64);
         }
@@ -495,13 +502,16 @@ impl LocalDestination {
     }
 
     /// Apply restic generic attributes to `item` — no-op off Windows.
-    /// kopia-0dr.39 increment 2a.
+    /// kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b.
     #[cfg(not(windows))]
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     pub(crate) fn set_generic_attributes(
         &self,
         _item: impl AsRef<Path>,
-        _generic_attributes: &std::collections::BTreeMap<String, String>,
+        _generic_attributes: &std::collections::BTreeMap<
+            String,
+            crate::backend::node::GenericAttributeValue,
+        >,
     ) -> LocalDestinationResult<()> {
         Ok(())
     }

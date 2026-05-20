@@ -1,5 +1,6 @@
 ---
 source: crates/core/src/archiver/tree.rs
+assertion_line: 149
 expression: result
 ---
 [
@@ -25,6 +26,7 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: {},
                 },
                 content: None,
                 subtree: None,
@@ -52,6 +54,7 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: {},
                 },
                 content: None,
                 subtree: None,
@@ -79,6 +82,7 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: {},
                 },
                 content: None,
                 subtree: None,
@@ -111,6 +115,7 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: {},
                 },
                 content: None,
                 subtree: None,
@@ -138,6 +143,7 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: {},
                 },
                 content: None,
                 subtree: None,

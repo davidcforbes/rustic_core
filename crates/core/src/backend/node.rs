@@ -279,15 +279,19 @@ pub struct Metadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_attributes: Vec<ExtendedAttribute>,
     /// restic-compatible per-node generic attributes (Windows security
-    /// descriptor, file attributes, …). Keyed by the restic
-    /// `GenericAttributeType` string; the value is the JSON-string form
-    /// restic stores (for the security descriptor: base64 of the raw
-    /// self-relative SD). `String` keeps `Metadata: Ord`. Empty on
-    /// non-Windows and on metadata-free nodes, so a snapshot without
-    /// Windows metadata serialises identically to upstream
-    /// rustic_core. (kopia-0dr.39 increment 2a.)
+    /// descriptor, file attributes, creation time). Keyed by the
+    /// restic `GenericAttributeType` string; values are wrapped in
+    /// [`GenericAttributeValue`] so the same map can carry the three
+    /// JSON shapes restic emits (string for the SD, number for the
+    /// file-attributes bitset, object for the creation FILETIME).
+    /// The custom enum's manual `Ord` keeps `Metadata: Ord`, which is
+    /// load-bearing in `crates/core/src/blob/tree.rs`.
+    /// Empty on non-Windows and on metadata-free nodes, so a snapshot
+    /// without Windows metadata serialises identically to upstream
+    /// rustic_core. (kopia-0dr.39 increment 2a, kopia-0dr.53
+    /// increment 2b.)
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub generic_attributes: std::collections::BTreeMap<String, String>,
+    pub generic_attributes: std::collections::BTreeMap<String, GenericAttributeValue>,
 }
 
 pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {
