@@ -475,13 +475,16 @@ impl LocalDestination {
     }
 
     /// Apply restic generic attributes to `item`. On Windows this
-    /// decodes the security descriptor from
-    /// `generic_attributes["windows.security_descriptor"]` (base64)
-    /// and applies it via `SetNamedSecurityInfoW`. Best-effort: a
-    /// decode/apply failure is silently dropped (restore continues).
-    /// 2b will widen the dispatch to also handle the file-attributes
-    /// and creation-time keys.
-    /// kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b.
+    /// Decodes the four Windows generic-attributes keys
+    /// (`windows.security_descriptor`, `windows.file_attributes`,
+    /// `windows.creation_time`, `windows.sparse_extents`) and applies
+    /// each via its Win32 counterpart. Best-effort: a decode/apply
+    /// failure on any key is silently dropped (restore continues).
+    /// Called from `commands::restore::set_metadata` AFTER all blob
+    /// writes complete, which is the order the sparse-extents pass
+    /// needs (it punches holes in already-written zero ranges).
+    /// kopia-0dr.39 increment 2a, kopia-0dr.53 increment 2b,
+    /// kopia-0dr.54 increment 2d.
     #[cfg(windows)]
     pub(crate) fn set_generic_attributes(
         &self,
@@ -491,15 +494,32 @@ impl LocalDestination {
             crate::backend::node::GenericAttributeValue,
         >,
     ) -> LocalDestinationResult<()> {
-        use crate::backend::node::{generic_attributes as ga, win_sd, GenericAttributeValue};
+        use crate::backend::node::{
+            generic_attributes as ga, win_sd, win_sparse, GenericAttributeValue,
+        };
         if generic_attributes.is_empty() {
             return Ok(());
         }
         let path = self.path(item);
-        // Apply order: attrs (sets ReadOnly/Hidden cleanly without
-        // affecting later opens), creation_time (uses
-        // WRITE_ATTRIBUTES which works on ReadOnly), SD (DACL changes
-        // last so any privilege check sees the final state).
+        // Apply order:
+        //  1. sparse_extents — must happen BEFORE file_attributes so
+        //     the FILE_ATTRIBUTE_SPARSE_FILE bit set by FSCTL_SET_SPARSE
+        //     can't be clobbered by a stale source attrs bitmap on a
+        //     dense restore target (the source may have had the bit
+        //     set but the destination file hasn't been flagged yet).
+        //  2. file_attributes — stamp ReadOnly/Hidden cleanly without
+        //     affecting later opens.
+        //  3. creation_time — uses WRITE_ATTRIBUTES which works on
+        //     ReadOnly.
+        //  4. security_descriptor — DACL changes last so any privilege
+        //     check sees the final state.
+        if let Some(GenericAttributeValue::SparseExtents(extents)) =
+            generic_attributes.get("windows.sparse_extents")
+        {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let _ = win_sparse::apply_sparseness(&path, extents, meta.len());
+            }
+        }
         if let Some(GenericAttributeValue::U32(attrs)) =
             generic_attributes.get("windows.file_attributes")
         {
