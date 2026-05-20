@@ -551,6 +551,34 @@ impl LocalDestination {
             generic_attributes.get(win_reparse::REPARSE_KEY)
         {
             if let Ok(body) = B64.decode(&blob.data) {
+                // create_special on Windows is currently a no-op for
+                // NodeType::Symlink (see this file, lines 715-721) —
+                // upstream rustic_core never actually creates Windows
+                // symlinks during restore. For 2c we need an existing
+                // host to stamp the reparse blob onto, so create an
+                // empty scaffold if the path doesn't exist. Kind
+                // (file vs dir) is decided by FILE_ATTRIBUTE_DIRECTORY
+                // (bit 0x10) on the captured windows.file_attributes.
+                // The reparse blob itself carries the substitute name
+                // and tag — FSCTL_SET_REPARSE_POINT then turns the
+                // empty scaffold into a real symlink / junction /
+                // arbitrary reparse host.
+                if !path.exists() {
+                    let is_dir = matches!(
+                        generic_attributes.get("windows.file_attributes"),
+                        Some(GenericAttributeValue::U32(a)) if *a & 0x0000_0010 != 0
+                    );
+                    if is_dir {
+                        let _ = std::fs::create_dir_all(&path);
+                    } else if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                        let _ = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&path);
+                    }
+                }
                 let _ = win_reparse::apply(&path, blob.tag, &body);
             }
         }
