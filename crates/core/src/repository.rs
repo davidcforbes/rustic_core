@@ -21,7 +21,7 @@ use serde_with::{DisplayFromStr, serde_as};
 use crate::{
     RepositoryBackends, RusticError,
     backend::{
-        FileType, FindInBackend, ReadBackend, WriteBackend,
+        FileType, FindInBackend, ReadBackend, ReadSource, WriteBackend,
         cache::{Cache, CachedBackend},
         decrypt::{DecryptBackend, DecryptReadBackend, DecryptWriteBackend},
         hotcold::HotColdBackend,
@@ -1686,6 +1686,67 @@ impl<S: IndexedIds> Repository<S> {
         snap: SnapshotFile,
     ) -> RusticResult<SnapshotFile> {
         commands::backup::backup(self, opts, source, snap)
+    }
+
+    /// Run a backup driven by a caller-supplied [`ReadSource`].
+    ///
+    /// [`backup`](Self::backup) constructs one of three built-in
+    /// sources ([`LocalSource`](crate::LocalSource),
+    /// [`StdinSource`](crate::backend::stdin::StdinSource), or
+    /// [`ChildStdoutSource`](crate::backend::childstdout::ChildStdoutSource))
+    /// from `source: &PathList` plus [`BackupOptions`]. This entry
+    /// point lets you substitute any [`ReadSource`] you like — for
+    /// example, a USN-driven synthetic stream that yields a parent
+    /// snapshot's Nodes verbatim for unchanged paths and only
+    /// live-stats the change-set. Rustic's parent matching, content
+    /// short-circuit, content-addressed tree dedup, dry-run handling,
+    /// and progress wiring all work unchanged.
+    ///
+    /// `source` is borrowed (matches
+    /// [`Archiver::archive`](crate::archiver::Archiver::archive)'s
+    /// `src: &R` signature) so callers that need post-archive
+    /// cleanup (e.g. flushing a child command) can hold the source.
+    /// `backup_path` is both the value written into `snap.paths`
+    /// (honouring [`BackupOptions::as_path`]) and the relativisation
+    /// prefix the archiver passes to [`Archiver::archive`]
+    /// (`&backup_path[0]`). `backup_stdin` is forwarded to
+    /// [`ParentOptions::get_parent`] so it can skip parent
+    /// resolution for non-fs sources.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - The backup options to use.
+    /// * `snap` - The snapshot to populate (mutated in place: paths,
+    ///   parent ids, tree id, summary).
+    /// * `source` - The caller-supplied source.
+    /// * `backup_path` - The path list used both for `snap.paths` and
+    ///   as the archiver's relativisation prefix.
+    /// * `backup_stdin` - Whether to treat this as a non-fs source
+    ///   for parent-resolution purposes.
+    ///
+    /// # Errors
+    ///
+    /// * If setting `snap.paths` fails.
+    /// * If parent resolution fails.
+    /// * If the archiver fails (see
+    ///   [`Archiver::archive`](crate::archiver::Archiver::archive)).
+    ///
+    /// # Returns
+    ///
+    /// The finalised [`SnapshotFile`].
+    pub fn backup_with_source<R: ReadSource + 'static>(
+        &self,
+        opts: &BackupOptions,
+        snap: SnapshotFile,
+        source: &R,
+        backup_path: &[PathBuf],
+        backup_stdin: bool,
+    ) -> RusticResult<SnapshotFile>
+    where
+        <R as ReadSource>::Open: Send,
+        <R as ReadSource>::Iter: Send,
+    {
+        commands::backup::backup_with_source(self, opts, snap, source, backup_path, backup_stdin)
     }
 }
 

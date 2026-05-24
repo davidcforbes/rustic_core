@@ -13,6 +13,7 @@ use crate::{
     CommandInput, Excludes,
     archiver::{Archiver, parent::Parent},
     backend::{
+        ReadSource,
         childstdout::ChildStdoutSource,
         dry_run::DryRunBackend,
         ignore::{LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions},
@@ -224,21 +225,99 @@ pub struct BackupOptions {
 /// # Returns
 ///
 /// The snapshot pointing to the backup'ed data.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn backup<S: IndexedIds>(
     repo: &Repository<S>,
     opts: &BackupOptions,
     source: &PathList,
-    mut snap: SnapshotFile,
+    snap: SnapshotFile,
 ) -> RusticResult<SnapshotFile> {
-    let index = repo.index();
-
     let backup_stdin = *source == PathList::from_string("-")?;
     let backup_path = if backup_stdin {
         vec![PathBuf::from(&opts.stdin_filename)]
     } else {
         source.paths()
     };
+
+    if backup_stdin {
+        let path = &backup_path[0];
+        if let Some(command) = &opts.stdin_command {
+            let src = ChildStdoutSource::new(command, path.clone())?;
+            let res = backup_with_source(repo, opts, snap, &src, &backup_path, true)?;
+            src.finish()?;
+            Ok(res)
+        } else {
+            let src = StdinSource::new(path.clone());
+            backup_with_source(repo, opts, snap, &src, &backup_path, true)
+        }
+    } else {
+        let src = LocalSource::new(
+            opts.ignore_save_opts,
+            &opts.excludes,
+            &opts.ignore_filter_opts,
+            &backup_path,
+        )?;
+        backup_with_source(repo, opts, snap, &src, &backup_path, false)
+    }
+}
+
+/// Generic core of [`backup`]: drives the [`Archiver`] against any
+/// [`ReadSource`]. Extracted so external callers (e.g. an
+/// incremental-walk wrapper that wants to substitute its own source
+/// for the default [`LocalSource`]) can reuse rustic's parent
+/// resolution, snapshot-path setup, dry-run backend, and progress
+/// wiring without duplicating ~80 lines of orchestration.
+///
+/// The existing [`backup`] entry point is now a thin shim that
+/// constructs the right built-in [`ReadSource`] ([`LocalSource`],
+/// [`StdinSource`], or [`ChildStdoutSource`]) from `source: &PathList`
+/// + [`BackupOptions`] and then delegates here. No semantics change
+/// for callers of [`backup`].
+///
+/// # Arguments
+///
+/// * `repo` - The repository to back up to.
+/// * `opts` - The backup options (parent matching, dry-run, etc.).
+/// * `snap` - The snapshot being constructed. The function mutates
+///   `snap.paths` (set from `backup_path` honouring `opts.as_path`)
+///   and `snap.parent`/`snap.parents` (set by parent resolution).
+/// * `source` - The [`ReadSource`] to drive the [`Archiver`] with.
+///   Borrowed (matches [`Archiver::archive`]'s `src: &R` signature)
+///   so callers that need post-archive cleanup (e.g.
+///   [`ChildStdoutSource::finish`]) can hold the source.
+/// * `backup_path` - The path list used both to populate `snap.paths`
+///   and as the relativisation prefix passed to [`Archiver::archive`]
+///   (`&backup_path[0]`). For [`LocalSource`] this is the operator's
+///   `--src` list; for stdin/child it is a synthetic single-entry
+///   vector built from `opts.stdin_filename`.
+/// * `backup_stdin` - Whether the source is stdin or a child command
+///   (vs. a real filesystem). Forwarded to
+///   [`ParentOptions::get_parent`] so it can skip parent resolution
+///   for non-fs sources.
+///
+/// # Errors
+///
+/// * If setting `snap.paths` fails.
+/// * If parent snapshot resolution fails.
+/// * If the archiver fails (see [`Archiver::archive`]).
+///
+/// # Returns
+///
+/// The finalised [`SnapshotFile`] (tree id stamped, summary
+/// populated, snapshot blob written unless dry-run).
+#[allow(clippy::too_many_lines)]
+pub(crate) fn backup_with_source<S: IndexedIds, R: ReadSource + 'static>(
+    repo: &Repository<S>,
+    opts: &BackupOptions,
+    mut snap: SnapshotFile,
+    source: &R,
+    backup_path: &[PathBuf],
+    backup_stdin: bool,
+) -> RusticResult<SnapshotFile>
+where
+    <R as ReadSource>::Open: Send,
+    <R as ReadSource>::Iter: Send,
+{
+    let index = repo.index();
 
     let as_path = opts
         .as_path
@@ -259,7 +338,7 @@ pub(crate) fn backup<S: IndexedIds>(
 
     let paths = match &as_path {
         Some(p) => std::slice::from_ref(p),
-        None => &backup_path,
+        None => backup_path,
     };
 
     snap.paths.set_paths(paths).map_err(|err| {
@@ -287,51 +366,16 @@ pub(crate) fn backup<S: IndexedIds>(
     }
 
     let be = DryRunBackend::new(repo.dbe().clone(), opts.dry_run);
-    info!("starting to backup {source} ...");
+    info!("starting to backup ...");
     let archiver = Archiver::new(be, index, repo.config(), parent, snap)?;
     let p = repo.progress_bytes("backing up...");
 
-    let snap = if backup_stdin {
-        let path = &backup_path[0];
-        if let Some(command) = &opts.stdin_command {
-            let src = ChildStdoutSource::new(command, path.clone())?;
-            let res = archiver.archive(
-                &src,
-                path,
-                as_path.as_ref(),
-                opts.parent_opts.skip_if_unchanged,
-                opts.no_scan,
-                &p,
-            )?;
-            src.finish()?;
-            res
-        } else {
-            let src = StdinSource::new(path.clone());
-            archiver.archive(
-                &src,
-                path,
-                as_path.as_ref(),
-                opts.parent_opts.skip_if_unchanged,
-                opts.no_scan,
-                &p,
-            )?
-        }
-    } else {
-        let src = LocalSource::new(
-            opts.ignore_save_opts,
-            &opts.excludes,
-            &opts.ignore_filter_opts,
-            &backup_path,
-        )?;
-        archiver.archive(
-            &src,
-            &backup_path[0],
-            as_path.as_ref(),
-            opts.parent_opts.skip_if_unchanged,
-            opts.no_scan,
-            &p,
-        )?
-    };
-
-    Ok(snap)
+    archiver.archive(
+        source,
+        &backup_path[0],
+        as_path.as_ref(),
+        opts.parent_opts.skip_if_unchanged,
+        opts.no_scan,
+        &p,
+    )
 }
