@@ -64,6 +64,18 @@ pub struct LocalSourceSaveOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub set_xattrs: Option<XattrOption>,
+
+    /// Number of OS threads used to enumerate the source tree
+    /// (`ignore::WalkParallel`). `None` (default) auto-selects
+    /// `std::thread::available_parallelism()` clamped to `[1, 32]`.
+    /// `Some(1)` falls back to the legacy single-threaded `ignore::Walk`
+    /// and is useful for deterministic ordering during tests. Higher
+    /// values pay off on deeply-nested workloads where one thread
+    /// readdir+stat'ing serially is the producer-side bottleneck
+    /// (kopia-0dr.63.1 Phase A).
+    #[cfg_attr(feature = "clap", clap(long, value_name = "N"))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
+    pub walker_threads: Option<usize>,
 }
 
 impl LocalSourceSaveOptions {
