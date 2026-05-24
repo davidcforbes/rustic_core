@@ -147,6 +147,120 @@ impl<'de> DeserializeAs<'de, Timestamp> for RusticTime {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    //! kopia-pl3 Track 1 — falsify the hypothesis that `RusticTime`'s
+    //! asymmetric serde (serialize via `display_with_offset(system_tz)`,
+    //! deserialize via `Timestamp::deserialize`) breaks byte-identity on
+    //! parent-passthrough Nodes during Phase E shadow runs.
+    //!
+    //! If these tests PASS: hypothesis ruled out; the Phase E divergence
+    //! lives elsewhere (ancestor-restat fidelity, deleted_set, ADS order,
+    //! etc.) — proceed to diff-snapshots triangulation.
+    //!
+    //! If these tests FAIL: the fix lives here in `RusticTime`. Use
+    //! jiff's own serde uniformly on both sides (drop the
+    //! `display_with_offset` custom path).
+    use super::*;
+    use jiff::Timestamp;
+    use serde::{Deserialize, Serialize};
+    use serde_with::serde_as;
+
+    #[serde_as]
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+    struct TsWrap {
+        #[serde_as(as = "RusticTime")]
+        ts: Timestamp,
+    }
+
+    /// Walk a Timestamp through the SAME serialize/deserialize path the
+    /// parent tree blob uses, then through it again. The bytes from the
+    /// second serialization must equal the bytes from the first — that
+    /// is what makes parent passthrough byte-identical on Node.mtime.
+    fn assert_round_trip_stable(ts: Timestamp, label: &str) {
+        let wrap0 = TsWrap { ts };
+        let json0 = serde_json::to_string(&wrap0)
+            .unwrap_or_else(|e| panic!("{label}: first serialize failed: {e}"));
+        let wrap1: TsWrap = serde_json::from_str(&json0)
+            .unwrap_or_else(|e| panic!("{label}: deserialize failed: {e} (input: {json0})"));
+        let json1 = serde_json::to_string(&wrap1)
+            .unwrap_or_else(|e| panic!("{label}: second serialize failed: {e}"));
+        assert_eq!(
+            json0, json1,
+            "{label}: round-trip is not byte-identical (jiff Timestamp value preserved: {})",
+            wrap1.ts == wrap0.ts
+        );
+    }
+
+    #[test]
+    fn timestamp_round_trip_is_byte_identical_simple() {
+        // Midnight UTC, no sub-second precision.
+        let ts: Timestamp = "2026-05-24T00:00:00Z".parse().unwrap();
+        assert_round_trip_stable(ts, "midnight_utc_no_subsec");
+    }
+
+    #[test]
+    fn timestamp_round_trip_is_byte_identical_with_nanos() {
+        // Full nanosecond precision — what NTFS FILETIME can produce
+        // when converted through SystemTime → jiff::Timestamp.
+        let ts: Timestamp = "2026-05-24T10:11:12.345678901Z".parse().unwrap();
+        assert_round_trip_stable(ts, "nanosecond_precision");
+    }
+
+    #[test]
+    fn timestamp_round_trip_is_byte_identical_dst_summer() {
+        // Summer (EDT, UTC-04:00) — when cycle 1 + 2 of the kopia-pl3
+        // soak actually ran.
+        let ts: Timestamp = "2026-07-15T14:30:00Z".parse().unwrap();
+        assert_round_trip_stable(ts, "dst_summer_edt");
+    }
+
+    #[test]
+    fn timestamp_round_trip_is_byte_identical_dst_winter() {
+        // Winter (EST, UTC-05:00) — a file last modified in January.
+        let ts: Timestamp = "2026-01-15T14:30:00Z".parse().unwrap();
+        assert_round_trip_stable(ts, "dst_winter_est");
+    }
+
+    #[test]
+    fn timestamp_round_trip_is_byte_identical_dst_transition_spring() {
+        // Spring-forward day (2026-03-09 in US): 2:00 AM jumps to 3:00 AM.
+        // Test a Timestamp just before, at, and just after the wall-clock
+        // jump.
+        for s in [
+            "2026-03-09T06:30:00Z", // 01:30 EST (before transition)
+            "2026-03-09T07:30:00Z", // 02:30 (skipped wall-clock window)
+            "2026-03-09T08:30:00Z", // 04:30 EDT (after transition)
+        ] {
+            let ts: Timestamp = s.parse().unwrap();
+            assert_round_trip_stable(ts, &format!("spring_forward_{s}"));
+        }
+    }
+
+    #[test]
+    fn timestamp_round_trip_is_byte_identical_dst_transition_fall() {
+        // Fall-back day (2026-11-02 in US): 2:00 AM repeats as 1:00 AM.
+        // The ambiguous wall-clock window is the dangerous one for a
+        // local-offset serializer.
+        for s in [
+            "2026-11-02T05:30:00Z", // 01:30 EDT (first occurrence)
+            "2026-11-02T06:30:00Z", // 01:30 EST (second occurrence, after fallback)
+            "2026-11-02T07:30:00Z", // 02:30 EST (after transition)
+        ] {
+            let ts: Timestamp = s.parse().unwrap();
+            assert_round_trip_stable(ts, &format!("fall_back_{s}"));
+        }
+    }
+
+    #[test]
+    fn timestamp_round_trip_handles_epoch_zero() {
+        // Edge case: SystemTime::UNIX_EPOCH converts to Timestamp(0).
+        // Files with truly absent mtime hit this.
+        let ts = Timestamp::UNIX_EPOCH;
+        assert_round_trip_stable(ts, "unix_epoch_zero");
+    }
+}
+
 // Part of public API
 use crate::Id;
 
