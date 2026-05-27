@@ -12,7 +12,9 @@ use std::path::Path;
 use std::ptr;
 
 use base64::Engine as _;
-use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{
+    LocalFree, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS,
+};
 use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
@@ -71,7 +73,15 @@ fn capture_with(path: &Path, info: u32) -> Option<String> {
 }
 
 /// Apply a base64-encoded self-relative security descriptor to `path`.
-/// Best-effort; returns false if decode or the core apply failed.
+/// Best-effort; returns true if any non-trivial component (DACL, owner,
+/// group, SACL) was written. Falls back through privilege tiers because
+/// `SetNamedSecurityInfoW` is all-or-nothing per call: if any one
+/// requested component requires a privilege we don't hold, the whole
+/// call returns ERROR_PRIVILEGE_NOT_HELD (1314) and the DACL never
+/// makes it onto the file. Unelevated processes typically lack
+/// SeSecurityPrivilege (SACL) and SeRestorePrivilege/SeTakeOwnership
+/// (OWNER even when the owner is self), so we retry with a shrinking
+/// info mask until DACL alone goes through. kopia-gw7a.
 pub fn apply(path: &Path, b64_sd: &str) -> bool {
     let Ok(sd) = base64::engine::general_purpose::STANDARD.decode(b64_sd) else {
         return false;
@@ -84,20 +94,54 @@ pub fn apply(path: &Path, b64_sd: &str) -> bool {
         let mut dacl: *mut ACL = ptr::null_mut();
         let mut sacl: *mut ACL = ptr::null_mut();
         let mut defaulted = 0;
-        let mut present = 0;
+        let mut dacl_present = 0;
+        let mut sacl_present = 0;
         GetSecurityDescriptorOwner(psd, &mut owner, &mut defaulted);
         GetSecurityDescriptorGroup(psd, &mut group, &mut defaulted);
-        GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted);
-        GetSecurityDescriptorSacl(psd, &mut present, &mut sacl, &mut defaulted);
-        let rc = SetNamedSecurityInfoW(
-            w.as_ptr() as *mut u16,
-            SE_FILE_OBJECT,
-            ALL_SD_INFO,
-            owner,
-            group,
-            dacl,
-            sacl,
-        );
-        rc == ERROR_SUCCESS
+        GetSecurityDescriptorDacl(psd, &mut dacl_present, &mut dacl, &mut defaulted);
+        GetSecurityDescriptorSacl(psd, &mut sacl_present, &mut sacl, &mut defaulted);
+
+        // Tiers from most-privileged to least. Each tier passes only
+        // the components it intends to write; the info mask + null
+        // pointers tell SetNamedSecurityInfoW which components to
+        // leave alone.
+        let dacl_info = if dacl_present != 0 { DACL_SECURITY_INFORMATION } else { 0 };
+        let sacl_info = if sacl_present != 0 { SACL_SECURITY_INFORMATION } else { 0 };
+        let owner_info = if !owner.is_null() { OWNER_SECURITY_INFORMATION } else { 0 };
+        let group_info = if !group.is_null() { GROUP_SECURITY_INFORMATION } else { 0 };
+        let tiers: [(u32, *mut _, *mut _, *mut ACL, *mut ACL); 3] = [
+            // Full SD (needs SeSecurityPrivilege + SeRestorePrivilege).
+            (owner_info | group_info | dacl_info | sacl_info, owner, group, dacl, sacl),
+            // Drop SACL (needs SeSecurityPrivilege).
+            (owner_info | group_info | dacl_info, owner, group, dacl, ptr::null_mut()),
+            // Drop OWNER + GROUP too — OWNER needs SeRestorePrivilege
+            // / SeTakeOwnership even when the captured owner is self.
+            // The file keeps whatever owner Windows assigned at create
+            // time (typically the restoring user, which matches the
+            // source for self-restore); the explicit DACL still
+            // propagates from the source SD.
+            (dacl_info, ptr::null_mut(), ptr::null_mut(), dacl, ptr::null_mut()),
+        ];
+        for (info, o, g, d, s) in tiers {
+            if info == 0 {
+                continue;
+            }
+            let rc = SetNamedSecurityInfoW(
+                w.as_ptr() as *mut u16,
+                SE_FILE_OBJECT,
+                info,
+                o,
+                g,
+                d,
+                s,
+            );
+            if rc == ERROR_SUCCESS {
+                return true;
+            }
+            if rc != ERROR_PRIVILEGE_NOT_HELD {
+                return false;
+            }
+        }
+        false
     }
 }
