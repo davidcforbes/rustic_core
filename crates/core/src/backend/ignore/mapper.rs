@@ -139,7 +139,7 @@ impl LocalSourceSaveOptions {
             size,
             links,
             extended_attributes,
-            generic_attributes: Self::generic_attributes(entry.path()),
+            generic_attributes: Self::generic_attributes(entry.path(), &m),
         };
 
         let node = self.to_node(&entry, &m, meta)?;
@@ -205,6 +205,7 @@ impl LocalSourceSaveOptions {
     #[cfg(windows)]
     fn generic_attributes(
         path: &std::path::Path,
+        fsmeta: &std::fs::Metadata,
     ) -> std::collections::BTreeMap<String, crate::backend::node::GenericAttributeValue> {
         use crate::backend::node::{
             generic_attributes, win_reparse, win_sd, win_sparse, GenericAttributeValue,
@@ -212,31 +213,49 @@ impl LocalSourceSaveOptions {
         };
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine;
+        use std::os::windows::fs::MetadataExt;
+
+        // kopia-0dr.63.11: the file attributes + creation time + sparse bit
+        // + reparse bit ALL live in the WIN32_FIND_DATA the directory walk
+        // already returned (cached in `fsmeta`, no syscall). Reading them
+        // from `fsmeta` replaces THREE redundant per-file
+        // GetFileAttributesExW calls (file_attributes_and_creation_time /
+        // is_sparse_file / is_reparse_point — each re-fetched the same
+        // dwFileAttributes). Only the security descriptor (not in the walk
+        // data) and the rare sparse/reparse *body* capture still syscall.
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
         let mut m = std::collections::BTreeMap::new();
-        if let Some((attrs, ct)) =
-            generic_attributes::capture::file_attributes_and_creation_time(path)
-        {
-            m.insert(
-                "windows.creation_time".to_string(),
-                GenericAttributeValue::CreationTime(ct),
-            );
-            m.insert(
-                "windows.file_attributes".to_string(),
-                GenericAttributeValue::U32(attrs),
-            );
-        }
-        if let Some(sd) = win_sd::capture(path) {
+
+        // Attributes + creation time — cached walk metadata, no syscall.
+        let attrs = fsmeta.file_attributes();
+        let ct64 = fsmeta.creation_time();
+        m.insert(
+            "windows.creation_time".to_string(),
+            GenericAttributeValue::CreationTime(generic_attributes::WindowsFiletime {
+                low_date_time: (ct64 & 0xFFFF_FFFF) as u32,
+                high_date_time: (ct64 >> 32) as u32,
+            }),
+        );
+        m.insert(
+            "windows.file_attributes".to_string(),
+            GenericAttributeValue::U32(attrs),
+        );
+
+        // Security descriptor — NOT in the walk data; the one genuinely
+        // required per-file syscall (GetNamedSecurityInfoW).
+        let sd = win_sd::capture(path);
+        if let Some(sd) = sd {
             m.insert(
                 win_sd::SD_KEY.to_string(),
                 GenericAttributeValue::String(sd),
             );
         }
-        // 2d sparse-extents capture: only emit the key for files
-        // genuinely flagged sparse on the source. Reparse-tagged
-        // hosts are never sparse (NTFS doesn't allow both bits),
-        // so this also implicitly short-circuits the syscall for
-        // junctions / symlinks / cloud placeholders.
-        if let Ok(true) = win_sparse::is_sparse_file(path) {
+
+        // 2d sparse-extents: only enumerate when the CACHED sparse bit is
+        // set (rare). The per-file is_sparse_file syscall is gone.
+        if attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0 {
             if let Ok(runs) = win_sparse::enumerate_allocated_ranges(path) {
                 if !runs.is_empty() {
                     let pairs: Vec<[i64; 2]> =
@@ -248,15 +267,12 @@ impl LocalSourceSaveOptions {
                 }
             }
         }
-        // 2c reparse-point capture: any host with
-        // FILE_ATTRIBUTE_REPARSE_POINT set gets its raw
-        // REPARSE_DATA_BUFFER body captured (sans the 8-byte fixed
-        // header — the tag is carried separately). On restore,
-        // FSCTL_SET_REPARSE_POINT rebuilds the buffer and stamps it
-        // onto the destination's pre-created host (file or empty dir).
-        // capture() opens with FILE_FLAG_OPEN_REPARSE_POINT so it
-        // never triggers OneDrive Files-On-Demand hydration.
-        if let Ok(true) = win_reparse::is_reparse_point(path) {
+
+        // 2c reparse-point: only capture the REPARSE_DATA_BUFFER body when
+        // the CACHED reparse bit is set (rare). The per-file
+        // is_reparse_point syscall is gone. capture() opens with
+        // FILE_FLAG_OPEN_REPARSE_POINT so it never hydrates cloud files.
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             if let Ok((tag, body)) = win_reparse::capture(path) {
                 if !body.is_empty() {
                     m.insert(
@@ -275,6 +291,7 @@ impl LocalSourceSaveOptions {
     #[cfg(not(windows))]
     fn generic_attributes(
         _path: &std::path::Path,
+        _fsmeta: &std::fs::Metadata,
     ) -> std::collections::BTreeMap<String, crate::backend::node::GenericAttributeValue> {
         std::collections::BTreeMap::new()
     }
@@ -456,7 +473,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("plain.txt");
         std::fs::write(&p, b"hello").unwrap();
-        let m = LocalSourceSaveOptions::generic_attributes(&p);
+        let m = LocalSourceSaveOptions::generic_attributes(
+            &p,
+            &std::fs::symlink_metadata(&p).unwrap(),
+        );
         assert!(
             !m.contains_key(win_reparse::REPARSE_KEY),
             "plain file should not carry windows.reparse_point, got keys: {:?}",
@@ -478,7 +498,10 @@ mod tests {
             eprintln!("skipping: mklink /J not available in this env");
             return;
         }
-        let m = LocalSourceSaveOptions::generic_attributes(&link);
+        let m = LocalSourceSaveOptions::generic_attributes(
+            &link,
+            &std::fs::symlink_metadata(&link).unwrap(),
+        );
         match m.get(win_reparse::REPARSE_KEY) {
             Some(GenericAttributeValue::ReparsePoint(blob)) => {
                 assert_eq!(blob.tag, win_reparse::IO_REPARSE_TAG_MOUNT_POINT);

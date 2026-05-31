@@ -407,6 +407,8 @@ impl ReadSource for LocalSource {
         LocalSourceWalker {
             walker: inner,
             save_opts: self.save_opts,
+            map_threads: threads,
+            chunk_buf: std::collections::VecDeque::new(),
             #[cfg(windows)]
             pending_ads: std::collections::VecDeque::new(),
             #[cfg(windows)]
@@ -436,6 +438,129 @@ fn walker_thread_count(opt: Option<usize>) -> usize {
         .clamp(1, 32)
 }
 
+/// kopia-0dr.63.11: how many sorted entries `next()` maps per parallel
+/// chunk. A chunk is `map_group`'d across the rayon pool then drained in
+/// order, so only one chunk's worth of built `Node`s is resident at a time
+/// (~a few MB) — not all N (which was the 6.9 GB blowup). 4096 gives every
+/// pool thread plenty of work while keeping the window tiny.
+const NODE_BUILD_CHUNK: usize = 4096;
+
+/// kopia-0dr.63.11: one DirEntry's node-build result, produced in parallel
+/// inside a chunk's `map_group`. The host entry plus any ADS siblings stay
+/// together so host-before-stream order is preserved on flatten;
+/// `is_reparse_dir` drives the sequential reparse-skip filter.
+struct MappedGroup {
+    /// Sort key = host path. `None` for walk errors / the dropped walk-root
+    /// (they carry no reparse semantics and a single mapped error / nothing).
+    sort_key: Option<PathBuf>,
+    is_reparse_dir: bool,
+    entries: Vec<RusticResult<ReadSourceEntry<OpenFile>>>,
+}
+
+/// Build a [`MappedGroup`] for one walker result — `map_entry` (the SD +
+/// node-build) + ADS enumeration. Mirrors the single-threaded `next()`
+/// per-entry logic so the parallel and legacy paths emit identical entry
+/// sets (the `phase_a_tests` equivalence test guards this). Pure given
+/// `save_opts` (`Copy`) + the entry, so it runs safely on the rayon pool.
+fn map_group(
+    save_opts: LocalSourceSaveOptions,
+    result: Result<DirEntry, ignore::Error>,
+) -> MappedGroup {
+    let entry = match result {
+        Ok(e) => e,
+        Err(err) => {
+            let mapped = Err(RusticError::with_source(
+                ErrorKind::Internal,
+                "Failed to get next entry from walk iterator.",
+                err,
+            )
+            .ask_report());
+            return MappedGroup {
+                sort_key: None,
+                is_reparse_dir: false,
+                entries: vec![mapped],
+            };
+        }
+    };
+    // Skip the walk root (depth-0 dir) — matches next()'s root skip.
+    if entry.depth() == 0 && entry.file_type().is_some_and(|t| t.is_dir()) {
+        return MappedGroup {
+            sort_key: None,
+            is_reparse_dir: false,
+            entries: Vec::new(),
+        };
+    }
+    let path = entry.path().to_path_buf();
+    let host = match save_opts.map_entry(entry) {
+        Ok(h) => h,
+        Err(err) => {
+            let mapped = Err(RusticError::with_source(
+                ErrorKind::Internal,
+                "Failed to map Directory entry to ReadSourceEntry.",
+                err,
+            )
+            .ask_report());
+            return MappedGroup {
+                sort_key: Some(path),
+                is_reparse_dir: false,
+                entries: vec![mapped],
+            };
+        }
+    };
+    #[cfg(windows)]
+    let (is_reparse_dir, entries) = {
+        use crate::backend::node::{win_reparse, NodeType};
+        let is_reparse_dir = matches!(host.node.node_type, NodeType::Dir)
+            && host
+                .node
+                .meta
+                .generic_attributes
+                .contains_key(win_reparse::REPARSE_KEY);
+        let mut siblings: Vec<RusticResult<ReadSourceEntry<OpenFile>>> = Vec::new();
+        if matches!(host.node.node_type, NodeType::File) {
+            if let Some(ref open) = host.open {
+                let host_path = open.path.clone();
+                let host_node = host.node.clone();
+                match crate::backend::node::win_ads::enumerate(&host_path) {
+                    Ok(streams) => {
+                        for (stream_name, size) in streams {
+                            let ads_node = crate::backend::ignore::mapper::ads_sibling_node(
+                                &host_node,
+                                &stream_name,
+                                size,
+                            );
+                            let ads_open = OpenFile::for_stream(
+                                host_path.clone(),
+                                stream_name.as_str().to_string(),
+                            );
+                            siblings.push(Ok(ReadSourceEntry {
+                                path: host_path.clone(),
+                                node: ads_node,
+                                open: Some(ads_open),
+                            }));
+                        }
+                    }
+                    Err(err) => warn!(
+                        "ignoring ADS enumeration failure on {}: {err}",
+                        host_path.display()
+                    ),
+                }
+            }
+        }
+        let mut entries = vec![Ok(host)];
+        entries.extend(siblings);
+        (is_reparse_dir, entries)
+    };
+    #[cfg(not(windows))]
+    let (is_reparse_dir, entries): (bool, Vec<RusticResult<ReadSourceEntry<OpenFile>>>) =
+        (false, vec![Ok(host)]);
+    MappedGroup {
+        sort_key: Some(path),
+        is_reparse_dir,
+        entries,
+    }
+}
+
 // The boxed walker (a `Vec::IntoIter` or `ignore::Walk`) doesn't
 // implement Debug, so the wrapper can't derive it either.
 #[allow(missing_debug_implementations)]
@@ -447,6 +572,16 @@ pub struct LocalSourceWalker {
     walker: Box<dyn Iterator<Item = Result<DirEntry, ignore::Error>> + Send>,
     /// The save options to use.
     save_opts: LocalSourceSaveOptions,
+    /// kopia-0dr.63.11: node-build thread count. `> 1` enables the chunked
+    /// parallel node-build (map_entry across the rayon pool, bounded
+    /// window via `chunk_buf`); `<= 1` keeps the legacy single-threaded
+    /// lazy map (the deterministic oracle path).
+    map_threads: usize,
+    /// kopia-0dr.63.11: drained-in-order buffer of the current parallel
+    /// chunk's mapped entries (host + ADS siblings). Refilled by
+    /// `map_group`'ing the next `NODE_BUILD_CHUNK` walk entries across the
+    /// pool. Only the parallel path uses it.
+    chunk_buf: std::collections::VecDeque<RusticResult<ReadSourceEntry<OpenFile>>>,
     /// Windows: NTFS Alternate Data Stream sibling entries buffered
     /// for the next `next()` calls. Each regular-file entry yielded
     /// by the underlying walker can produce N additional sibling
@@ -476,6 +611,52 @@ impl Iterator for LocalSourceWalker {
     type Item = RusticResult<ReadSourceEntry<OpenFile>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // kopia-0dr.63.11: chunked parallel node-build. Map the next
+        // NODE_BUILD_CHUNK sorted walk entries across the rayon pool
+        // (map_entry is now SD-only after the redundant-syscall
+        // elimination, and SD parallelises ~11.5x), drain in order. Only a
+        // single chunk's worth of built Nodes is resident — no 6.9 GB
+        // collect. Reparse-skip uses the persistent prefix stack across
+        // chunks; the sorted (depth-first) order makes that exact.
+        if self.map_threads > 1 {
+            use rayon::prelude::*;
+            loop {
+                if let Some(entry) = self.chunk_buf.pop_front() {
+                    return Some(entry);
+                }
+                let chunk: Vec<Result<DirEntry, ignore::Error>> =
+                    self.walker.by_ref().take(NODE_BUILD_CHUNK).collect();
+                if chunk.is_empty() {
+                    return None;
+                }
+                let save_opts = self.save_opts;
+                let groups: Vec<MappedGroup> = chunk
+                    .into_par_iter()
+                    .map(|de| map_group(save_opts, de))
+                    .collect();
+                for g in groups {
+                    #[cfg(windows)]
+                    if let Some(ref p) = g.sort_key {
+                        // Pop prefixes whose subtree we've left; drop strict
+                        // descendants of an active reparse (junction) dir.
+                        self.reparse_skip.retain(|pfx| p.starts_with(pfx));
+                        if self
+                            .reparse_skip
+                            .iter()
+                            .any(|pfx| p.starts_with(pfx) && p != pfx.as_path())
+                        {
+                            continue;
+                        }
+                        if g.is_reparse_dir {
+                            self.reparse_skip.push(p.clone());
+                        }
+                    }
+                    self.chunk_buf.extend(g.entries);
+                }
+            }
+        }
+
+        // --- legacy single-threaded path (map_threads <= 1) ---
         // Drain buffered ADS siblings before pulling another walker
         // entry. On non-Windows this branch is removed by the cfg.
         #[cfg(windows)]
@@ -660,6 +841,68 @@ mod phase_a_tests {
             serial.len() >= 1000,
             "fixture should produce >=1000 entries, got {}",
             serial.len()
+        );
+    }
+
+    // kopia-0dr.63.11: the chunked parallel node-build moved map_entry +
+    // ADS into a rayon par-map and does reparse-skip as a cross-chunk
+    // prefix filter. Guard those parallel-specific paths against the
+    // single-threaded oracle on the two cases the plain-file fixture can't
+    // exercise: an NTFS ADS sibling (duplicate host-path entry) and a
+    // junction whose descendants must be skipped. Both creatable
+    // non-elevated (ADS via a `:stream` path, junction via `mklink /J`).
+    #[cfg(windows)]
+    #[test]
+    fn parallel_matches_single_thread_with_ads_and_junction() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::write(root.join("host.txt"), b"host body").unwrap();
+        std::fs::write(root.join("host.txt:adsname"), b"stream body").unwrap();
+
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("inside.txt"), b"x").unwrap();
+        let link = root.join("link");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J should create the junction");
+
+        let serial = collect_paths(
+            LocalSourceSaveOptions::default().walker_threads(Some(1usize)),
+            root,
+        );
+        let parallel = collect_paths(
+            LocalSourceSaveOptions::default().walker_threads(Some(8usize)),
+            root,
+        );
+
+        assert_eq!(
+            serial, parallel,
+            "chunked parallel ADS+junction walk must match single-thread output"
+        );
+        let host_count = serial
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "host.txt"))
+            .count();
+        assert!(
+            host_count >= 2,
+            "expected host + ADS sibling for host.txt, got {host_count}"
+        );
+        assert!(
+            !serial
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == "link")
+                    && p.file_name().is_some_and(|n| n == "inside.txt")),
+            "junction descendants must be skipped"
         );
     }
 
